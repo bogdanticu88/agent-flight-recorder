@@ -1,0 +1,18 @@
+{
+  "log_path": "C:\\ProgramData\\AgentFlightRecorder\\logs\\%USERNAME%.jsonl",
+  "max_text": 8000,
+  "capture_results": true,
+  "fail_closed": false,
+  "rules": [
+    { "pattern": "**/artifactory_credentials_backup.txt", "action": "alert", "label": "SOC honeypot HP-17" },
+    { "pattern": "**/passwords_old.xlsx",                  "action": "alert", "label": "SOC honeypot HP-03" },
+
+    { "pattern": "**/.ssh/**",               "action": "deny", "label": "SSH keys" },
+    { "pattern": "**/.aws/credentials",      "action": "deny", "label": "AWS credentials" },
+    { "pattern": "**/.azure/**",             "action": "deny", "label": "Azure CLI tokens" },
+    { "pattern": "**/.npmrc",                "action": "alert", "label": "npm registry token file" },
+    { "pattern": "**/.jfrog/**",             "action": "deny", "label": "JFrog CLI credentials" },
+    { "pattern": "**/AppData/Roaming/Microsoft/Credentials/**", "action": "deny", "label": "Windows credential store" },
+    { "pattern": "**/*.kdbx",                "action": "deny", "label": "KeePass database" }
+  ]
+}

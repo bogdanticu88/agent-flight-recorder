@@ -1,0 +1,53 @@
+// ---------------------------------------------------------------------------
+// Agent Flight Recorder - Sentinel queries
+// Assumes the Azure Monitor Agent ships the live JSONL to a custom table
+// AgentFlightRecorder_CL (see deploy/sentinel/README.md for the DCR).
+// ---------------------------------------------------------------------------
+
+// 1. Analytic rule: an AI agent touched a protected path (honeypot or secret)
+AgentFlightRecorder_CL
+| where decision in ("alert", "deny")
+| project TimeGenerated, host, user, agent, session_id, tool, decision, reason, paths, command, cwd
+
+// 2. Everything one agent session did, in order (paste the session_id from the alert)
+AgentFlightRecorder_CL
+| where session_id == "<session_id>"
+| order by ts asc, seq asc
+| project ts, kind, tool, command, input, text, decision, reason
+
+// 3. The prompt the human gave before an alert (last prompt in the same session)
+let alerts = AgentFlightRecorder_CL | where decision in ("alert", "deny") | project alert_ts = ts, session_id, host, tool, reason;
+AgentFlightRecorder_CL
+| where kind == "prompt"
+| join kind=inner alerts on session_id
+| where ts <= alert_ts
+| summarize arg_max(ts, text) by session_id, host, alert_ts, tool, reason
+| project alert_ts, host, session_id, prompt = text, tool, reason
+
+// 4. Correlate an MDE honeypot hit with agent activity on the same device.
+//    Agent built-in file tools run inside the editor process, not a shell, so
+//    the initiating process is Code.exe / Cursor.exe / node.exe, not powershell.
+let honeypot = "artifactory_credentials_backup.txt";
+DeviceFileEvents
+| where FileName =~ honeypot
+| project hit_ts = Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| join kind=leftouter (
+    AgentFlightRecorder_CL
+    | where paths has honeypot or command has honeypot or input has honeypot
+    | project agent_ts = ts, host, agent, session_id, tool, decision
+  ) on $left.DeviceName == $right.host
+| extend delta_s = datetime_diff('second', hit_ts, agent_ts)
+| where isnull(delta_s) or abs(delta_s) < 120
+| project hit_ts, DeviceName, InitiatingProcessFileName, agent, session_id, tool, delta_s
+
+// 5. Hunting: honeypot access from editor/agent processes when no live recorder is deployed
+DeviceFileEvents
+| where FileName in~ ("artifactory_credentials_backup.txt")   // your honeypot names
+| where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "Cursor.exe", "Windsurf.exe", "node.exe", "copilot.exe", "claude.exe", "codex.exe", "opencode.exe", "gemini.exe")
+    or InitiatingProcessCommandLine has_any ("extensionHost", "utility-sub-type=node", "copilot", "claude", "codex", "opencode", "gemini")
+| project Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType
+
+// 6. Hygiene: agents running with auto-approve or hooks that broke the chain
+//    (run `afr verify` on collected logs; chain breaks mean records were removed or edited)
+AgentFlightRecorder_CL
+| summarize sessions = dcount(session_id), tool_calls = countif(kind == "tool_call"), alerts = countif(decision != "") by agent, bin(TimeGenerated, 1d)
