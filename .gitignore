@@ -1,0 +1,5 @@
+/afr
+/dist/
+*.zip
+*.zip.sha256
+afr-report.html
