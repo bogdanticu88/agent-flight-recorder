@@ -27,7 +27,7 @@ AgentFlightRecorder_CL
 // 4. Correlate an MDE honeypot hit with agent activity on the same device.
 //    Agent built-in file tools run inside the editor process, not a shell, so
 //    the initiating process is Code.exe / Cursor.exe / node.exe, not powershell.
-let honeypot = "artifactory_credentials_backup.txt";
+let honeypot = "deploy_keys.txt";
 DeviceFileEvents
 | where FileName =~ honeypot
 | project hit_ts = Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
@@ -42,7 +42,7 @@ DeviceFileEvents
 
 // 5. Hunting: honeypot access from editor/agent processes when no live recorder is deployed
 DeviceFileEvents
-| where FileName in~ ("artifactory_credentials_backup.txt")   // your honeypot names
+| where FileName in~ ("deploy_keys.txt")   // your honeypot names
 | where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "Cursor.exe", "Windsurf.exe", "node.exe", "copilot.exe", "claude.exe", "codex.exe", "opencode.exe", "gemini.exe")
     or InitiatingProcessCommandLine has_any ("extensionHost", "utility-sub-type=node", "copilot", "claude", "codex", "opencode", "gemini")
 | project Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, ActionType

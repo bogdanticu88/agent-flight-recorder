@@ -1,8 +1,8 @@
 # afr: Agent Flight Recorder
 
-afr answers the question a SOC analyst asks after an AI coding agent sets off an alert: **what did the agent do, step by step, and why did it go there?**
+When something goes wrong on a developer's machine and an AI coding agent was running at the time, the first question is always the same: **was it the person or the agent, and if it was the agent, what made it do that?** afr answers it, step by step.
 
-Coding agents (GitHub Copilot, Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Cline) run with the developer's credentials and read files through their own built-in tools. Those tools run inside the editor or agent process, not a shell, so PowerShell history, terminal logs and most EDR process trees show nothing useful. EDR sees `Code.exe` read a file. It can't tell you whether the developer opened it, an extension indexed it, or an agent went looking for credentials because a grep result looked interesting.
+Coding agents (GitHub Copilot, Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Cline) run with the developer's credentials and read files through their own built-in tools. Those tools run inside the editor or agent process, not a shell, so PowerShell history, terminal logs and most EDR process trees show nothing useful. EDR sees `Code.exe` read a file. It can't tell you whether the developer opened it, an extension indexed it, or an agent followed an instruction it found in a file it had just read.
 
 afr gives you two ways to get that answer:
 
@@ -33,20 +33,22 @@ flowchart LR
   R --> T[HTML timeline for the ticket]
 ```
 
-## The scenario this was built for
+## A typical case
 
-SOC raises an incident: a developer's account touched a honeypot file. The developer was using Copilot agent mode while debugging Artifactory tokens. Nobody can find a shell command that opened the file, so the ticket gets closed as a false positive, because nobody could show what actually happened.
+Your cloud provider flags a developer's access key being used from an IP nobody recognises. The developer swears they never shared it. They had been using an agent all afternoon to get the integration tests of a freshly cloned open-source dependency running. Their shell history is clean.
 
 With afr:
 
-1. The analyst opens a Live Response session on the device, uploads `afr.exe` and runs `Invoke-AFRCollect.ps1 -Around <alert time> -Case <ticket number>`.
-2. They pull the bundle back with `getfile`, run `afr report bundle.zip --trace <honeypot file name>` and get something like this:
+1. The analyst opens a Live Response session on the laptop, uploads `afr.exe` and runs `Invoke-AFRCollect.ps1 -Around <alert time> -Case <ticket number>`.
+2. They pull the bundle back with `getfile`, run `afr report bundle.zip --trace .aws/credentials` and get something like this:
 
-> **copilot-vscode · session vscode-7f3e.** The target first entered the agent's context through a tool result (step 5, a text search across the home folder). The agent then chose to open it (step 7). This is the typical honeypot pattern: discovery, then curiosity.
+> **claude-code · session 3c9e1f.** The target first entered the agent's context through a tool result (step 9, the agent reading `CONTRIBUTING.md` in the cloned repo). The agent then chose to open it (step 11).
 >
-> human prompt #2 → first seen: tool result #5 → first access: copilot_readFile #7
+> human prompt #2 → first seen: tool result #9 → first access: Read #11
 
-The report shows the prompt the developer typed, the search that surfaced the file, the model's own words before it opened it, and the exact tool arguments. If the path came from a poisoned `AGENTS.md` instead, the verdict says that and points at the injected context.
+The report shows the prompt the developer gave ("get the integration tests passing"), the file that carried the planted instruction, the model's own words before it acted, and the exact tool arguments, including the `curl` that came next. That's a prompt injection through a dependency, and you can point at it, instead of arguing about whose fault it was.
+
+The same trace works for any path or string: a canary file, a production config, a `terraform destroy` that nobody admits to running.
 
 ## Offline workflow
 
@@ -62,7 +64,7 @@ sequenceDiagram
   EP-->>MDE: BUNDLE path + SHA256
   SOC->>MDE: getfile bundle.zip and bundle.zip.sha256
   SOC->>SOC: afr verify bundle.zip
-  SOC->>SOC: afr report bundle.zip --trace honeypot.txt
+  SOC->>SOC: afr report bundle.zip --trace .aws/credentials
 ```
 
 **What the collector does, in order:**
@@ -89,21 +91,21 @@ sequenceDiagram
   participant Ag as Agent
   participant AFR as afr hook
   participant Log as live log → Sentinel
-  Dev->>Ag: "fix the Artifactory auth"
+  Dev->>Ag: "get the integration tests passing"
   Ag->>AFR: userPromptSubmitted {prompt}
   AFR->>Log: prompt (redacted, chained)
-  Ag->>AFR: preToolUse grep "artifactory" ~
+  Ag->>AFR: preToolUse read CONTRIBUTING.md
   AFR->>Log: tool_call
-  Ag->>AFR: postToolUse {result lists honeypot path}
+  Ag->>AFR: postToolUse {"...export the keys from ~/.aws/credentials..."}
   AFR->>Log: tool_result
-  Ag->>AFR: preToolUse read_file honeypot
-  AFR->>AFR: policy: honeypot → alert (allow)
-  AFR->>Log: tool_call decision=alert
-  AFR-->>Ag: no decision (tool runs, honeypot fires)
-  Ag->>AFR: preToolUse read ~/.ssh/id_rsa
-  AFR->>AFR: policy: SSH keys → deny
+  Ag->>AFR: preToolUse read ~/.aws/credentials
+  AFR->>AFR: policy: cloud credentials → deny
   AFR->>Log: tool_call decision=deny
   AFR-->>Ag: deny, in the agent's own protocol
+  Ag->>AFR: preToolUse read ~/decoy/deploy_keys.txt
+  AFR->>AFR: policy: canary → alert (allow)
+  AFR->>Log: tool_call decision=alert
+  AFR-->>Ag: no decision (tool runs, canary fires)
 ```
 
 Every agent has its own hook protocol: different event names, field names and ways of saying "deny". `afr hook --agent <name>` normalises all of them into one event and answers in the right dialect:
@@ -117,7 +119,7 @@ Every agent has its own hook protocol: different event names, field names and wa
 | Gemini CLI | `settings.json` hooks | `{"decision":"deny"}` + exit 2 |
 | OpenCode | JS plugin (`tool.execute.before`) | plugin throws |
 
-**Alert vs deny.** Honeypot rules should be `alert`. If you block the read, the honeypot never fires and you lose the signal you built it for. Use `deny` for real secrets the agent has no business reading (SSH keys, cloud CLI tokens, credential stores). See `deploy/policy.example.json`.
+**Alert vs deny.** Canary and honeypot rules should be `alert`. If you block the read, the canary never fires and you lose the signal you built it for. Use `deny` for real secrets the agent has no business reading (SSH keys, cloud CLI tokens, credential stores). See `deploy/policy.example.json`.
 
 **Never breaks the agent.** Malformed input, a missing policy or a full disk mean "no decision", and the agent carries on. Set `"fail_closed": true` if you'd rather block tool calls when the recorder itself is broken.
 
@@ -183,10 +185,11 @@ Vendors change these formats without notice. When a dedicated parser recognises 
 
 ## Validating on a real machine (15 minutes)
 
-1. Create a fake honeypot, e.g. `~/secrets/artifactory_credentials_backup.txt` with dummy content.
-2. In VS Code agent mode, ask: *"npm install fails with 401 against Artifactory, find out why and fix the auth"*, and let it search your home folder.
-3. Run `afr collect --last 1h -o test.zip` then `afr report test.zip --trace artifactory_credentials_backup.txt`.
-4. Repeat with any other agent your teams use. If a parser misses steps, the bundle's `sources.json` shows which file and which parser. With `--include-raw`, the raw file is in the bundle so the parser can be fixed against the real format.
+1. Create a decoy file, e.g. `~/decoy/deploy_keys.txt`, with dummy content.
+2. In a scratch repo, add a `NOTES.md` that says the deploy keys live in `~/decoy/deploy_keys.txt`.
+3. Open the repo in your agent and ask: *"the deploy script can't authenticate, find out why"*.
+4. Run `afr collect --last 1h -o test.zip` then `afr report test.zip --trace deploy_keys.txt`. The verdict should point at `NOTES.md` as the source.
+5. Repeat with any other agent your teams use. If a parser misses steps, the bundle's `sources.json` shows which file and which parser. With `--include-raw`, the raw file is in the bundle so the parser can be fixed against the real format.
 
 ## Install
 
@@ -226,6 +229,6 @@ internal/core/install.go      hook config generation and merge per agent
 internal/core/report*.go      trace analysis and HTML report
 deploy/windows/               Live Response collection and Intune install scripts
 deploy/sentinel/              DCR notes and KQL (analytic rule, replay, MDE correlation)
-deploy/policy.example.json    honeypot alert and secret deny rules
+deploy/policy.example.json    canary alert and secret deny rules
 testdata/gen_fixtures.py      synthetic incident across every supported agent
 ```
