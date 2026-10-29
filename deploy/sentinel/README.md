@@ -53,4 +53,4 @@ replay query, the "what was the prompt" join and the correlation with
 If Sentinel already raises tickets in your ITSM tool (ServiceNow, Jira),
 add the output of query 3 (the prompt and the tool call) to the incident
 entities. The analyst then opens the ticket with the answer already in it,
-instead of starting from "user touched honeypot".
+instead of starting from "user touched a canary file".

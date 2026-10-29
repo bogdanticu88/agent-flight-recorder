@@ -206,9 +206,9 @@ go build -o afr .
 ```text
 ./build.sh          # Windows, macOS, Linux on amd64 and arm64, plus SHA256SUMS
 go test ./...
-python3 testdata/gen_fixtures.py /tmp/afrt     # synthetic incident across all agents
+python3 testdata/gen_fixtures.py /tmp/afrt     # synthetic sessions for every supported agent
 afr collect --home /tmp/afrt/home/dev --around 2026-10-29T13:44:00Z --margin 1h -o demo.zip
-afr report demo.zip --trace artifactory_credentials_backup.txt
+afr report demo.zip --trace .aws/credentials
 ```
 
 Pure Go with no cgo; SQLite is read with `modernc.org/sqlite`. Single static binary, about 9 MB.

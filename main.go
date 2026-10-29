@@ -283,7 +283,7 @@ func loadInputs(paths []string) (core.ReportData, error) {
 func cmdReport(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
 	var traces multi
-	fs.Var(&traces, "trace", "path or file name to trace (repeatable), e.g. the honeypot")
+	fs.Var(&traces, "trace", "path, file name or string to trace (repeatable)")
 	out := fs.String("o", "afr-report.html", "output HTML")
 	title := fs.String("title", "Agent activity reconstruction", "report title")
 	inputs := reorder(fs, args)
