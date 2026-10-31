@@ -170,6 +170,8 @@ sequenceDiagram
 
 A configured policy that can't be read, has unknown fields or fails validation is an **error**, never an empty policy. It is reported on stderr and recorded. What pre-tool calls get while the policy is broken is decided by a separate, admin-controlled marker file `on-policy-error` next to the managed policy, containing `deny` or `allow` (default `allow`). A broken file can't be trusted to say whether it wanted to fail closed.
 
+**Interrupted writes.** If a hook process is killed while writing, the log can end with a partial line. The next hook still records: it starts a new line and writes `prev_hash: "unparseable-tail"`, and stderr says recording resumed. Verification then reports the log as `invalid` at that point rather than hiding the gap. Earlier builds refused to append after a torn line, which turned one killed process into a permanent stop.
+
 **Rules.** Each rule is `alert` or `deny`. All matching rules are recorded. If any matching rule is `deny`, the call is denied, wherever that rule sits in the file. Use `alert` for canary files (a blocked canary never fires) and `deny` for real secrets. `fail_closed: true` denies pre-tool calls whose payload can't be validated, or that can't be recorded. A deny message says whether the attempt was recorded. It never claims a record that failed.
 
 **Limits of path blocking.** Rules are string and glob matches over the recorded tool arguments. **This is not a filesystem sandbox.** Symlinks, junctions, `..` segments, environment variables, shell globbing, encodings, copying a file first, or a script that builds the path at run time can all reach a protected file without its path appearing literally in the arguments. Treat `deny` as a guard rail that catches the obvious case and records the attempt, not as access control.
@@ -254,12 +256,16 @@ afr report demo.zip --trace .aws/credentials
 
 Pure Go with no cgo; SQLite is read with `modernc.org/sqlite`. CI (`.github/workflows/ci.yml`) runs vet, tests and the fixture workflow on Linux, macOS and Windows, plus the race detector on Linux and macOS.
 
+**Windows validation.** `test/windows/Invoke-WindowsValidation.ps1` runs on a real Windows host from an elevated prompt. It checks the log ACL and the append-only opener as two disposable standard users (appends, concurrency, lock recovery, killed writers, overwrite/truncate/delete/permission-change attempts, another user's log, log-name squatting), executes both deployment scripts against temporary folders only, drives them into every native-failure path with a stub, parses all scripts with Windows PowerShell 5.1 and PowerShell 7, and runs vet, tests, race (when cgo and a C compiler are present) and the fixture workflow. Results and raw output are kept under `C:\afr-winval-<timestamp>\evidence`. `-CleanupOnly` removes leftover test accounts.
+
 ## Compatibility notes (0.2)
 
 - Bundles are format `afr-bundle` version 2. Bundles written by afr 0.1 (no `format` field) are rejected by `verify` and `report`. Re-collect them.
 - `collect` exports the live log as `live/excerpt.jsonl` (in-window records plus a header) by default. Use `--full-live-log` for the old behaviour (`live/events.jsonl`, whole log). Live records are no longer duplicated into `events.jsonl`.
 - `collect` exits `3` for partial collections, now including malformed records, unstable sources and a live log that isn't a consistent chain. It reads the live log from `--live-log` or the managed policy only, never from the user's policy or `AFR_LOG`.
-- `verify` of a standalone excerpt exits `2`. `--checkpoint` requires a 64-hex hash. `verify` and `report` exit `2` when any input fails verification, and `verify` exits `1` with no inputs.
+- `verify` of a standalone excerpt exits `2`. `--checkpoint` requires a 64-hex hash.
+- The live recorder resumes after a torn last line instead of refusing to append; the break is marked with `prev_hash: "unparseable-tail"`.
+- `Install-AFR.ps1` grants permissions by well-known SID, and both deployment scripts take isolation parameters (`-ProgramDir`, `-DataDir`, `-ProfilesRoot`, `-SkipMachineHooks`; `-ProfileDir`, `-OutDir`, `-AfrPath`). `verify` and `report` exit `2` when any input fails verification, and `verify` exits `1` with no inputs.
 - Live-log status names changed: `intact` is now `consistent`, with new `missing`, `unreadable`, `invalid`, `unanchored` and `excerpt` states. Existing logs still verify: new event fields are omitted when empty, so old record hashes are unchanged.
 - An invalid policy is now an error, not an empty policy. Unknown fields in a policy file are rejected. `AFR_POLICY` and `AFR_LOG` are ignored when a managed policy exists. `afr hook` rejects unknown `--agent` values.
 - Codex denies now use the documented `hookSpecificOutput` JSON instead of exit code 2. The Claude Code install adds `PostToolUseFailure`.

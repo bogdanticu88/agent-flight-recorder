@@ -522,6 +522,11 @@ func RunHook(agent, eventName string, stdin io.Reader, r Roots) HookResult {
 	RedactEvent(&e)
 	TruncateEvent(&e, maxText(pol))
 	appendErr := AppendLive(logPath, &e, lockDir(r))
+	var resumed *ChainResumedError
+	if errors.As(appendErr, &resumed) {
+		problems = append(problems, resumed.Error())
+		appendErr = nil
+	}
 
 	if appendErr != nil && pre && pol.FailClosed && st.Err == nil && !deny {
 		deny, denyWhy = true, "the call could not be recorded and policy is fail-closed"
@@ -621,16 +626,22 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 		return err
 	}
 	defer unlock()
-	prev, err := lastHash(path)
+	prev, torn, needNL, err := lastHash(path)
 	if err != nil {
 		return err
 	}
 	e.PrevHash = prev
+	if torn {
+		e.PrevHash = TornTailPrevHash
+	}
 	e.Pos, e.Prov, e.Outcome, e.OutcomeNote = 0, "", "", ""
 	e.Hash = e.ComputeHash()
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
+	}
+	if needNL {
+		b = append([]byte("\n"), b...)
 	}
 	f, err := openAppend(path)
 	if err != nil {
@@ -640,7 +651,26 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 		f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if torn {
+		return &ChainResumedError{Path: path}
+	}
+	return nil
+}
+
+// TornTailPrevHash is written as prev_hash when the log's last line could not
+// be parsed (typically a writer killed mid-record). It is deliberately not a
+// hash, so verification reports the break instead of hiding it.
+const TornTailPrevHash = "unparseable-tail"
+
+// ChainResumedError reports that a record was written after an unparseable
+// tail. The record is on disk; the chain is visibly broken at that point.
+type ChainResumedError struct{ Path string }
+
+func (e *ChainResumedError) Error() string {
+	return "the last line of " + e.Path + " was not a valid record (torn write or tampering); recording resumed and the chain break is marked"
 }
 
 func lockFile(p string) (func(), error) {
@@ -662,25 +692,26 @@ func lockFile(p string) (func(), error) {
 	}
 }
 
-// lastHash returns the hash of the last record, "" for a new or empty log, or
-// an error when the tail cannot be read or parsed. Appending after an
-// unparseable tail would silently fork the chain, so it is refused.
-func lastHash(path string) (string, error) {
+// lastHash returns the hash of the last record ("" for a new or empty log),
+// whether the last line is unparseable (torn), and whether the file lacks a
+// final newline. A torn tail does not stop recording: stopping would turn one
+// killed hook into a permanent loss of evidence. The caller marks the break.
+func lastHash(path string) (hash string, torn, needNewline bool, err error) {
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
+		return "", false, false, nil
 	}
 	if err != nil {
-		return "", err
+		return "", false, false, err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return "", err
+		return "", false, false, err
 	}
 	size := st.Size()
 	if size == 0 {
-		return "", nil
+		return "", false, false, nil
 	}
 	chunk := int64(1 << 20)
 	if chunk > size {
@@ -688,14 +719,15 @@ func lastHash(path string) (string, error) {
 	}
 	buf := make([]byte, chunk)
 	if _, err := f.ReadAt(buf, size-chunk); err != nil && err != io.EOF {
-		return "", err
+		return "", false, false, err
 	}
+	needNewline = buf[len(buf)-1] != '\n'
 	lines := bytes.Split(bytes.TrimRight(buf, "\n"), []byte("\n"))
 	var e Event
 	if err := json.Unmarshal(lines[len(lines)-1], &e); err != nil || e.Hash == "" {
-		return "", fmt.Errorf("last record of %s is not a valid chained record; refusing to append", path)
+		return "", true, needNewline, nil
 	}
-	return e.Hash, nil
+	return e.Hash, false, needNewline, nil
 }
 
 // Chain verification states.

@@ -64,3 +64,29 @@ jobs:
             if ($errs) { $errs | ForEach-Object { Write-Output "$($f.Name): $_" }; $failed = $true }
           }
           if ($failed) { exit 1 }
+
+  windows-validation:
+    # Full Windows suite on a disposable hosted runner: ACLs, standard-user
+    # accounts, deployment scripts, native failure handling. Evidence is
+    # uploaded whatever the outcome.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: validation suite
+        shell: powershell
+        run: |
+          $work = Join-Path $env:SystemDrive "afr-winval-ci"
+          powershell -NoProfile -ExecutionPolicy Bypass -File test\windows\Invoke-WindowsValidation.ps1 -WorkRoot $work
+          exit $LASTEXITCODE
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-validation-evidence
+          path: C:\afr-winval-ci\evidence

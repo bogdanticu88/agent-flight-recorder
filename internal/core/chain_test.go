@@ -158,13 +158,39 @@ func TestExcerptVerification(t *testing.T) {
 	}
 }
 
-func TestAppendRefusesUnparseableTail(t *testing.T) {
+func TestAppendResumesAfterTornTail(t *testing.T) {
 	p, lines := chainedLog(t, 2)
-	rewrite(t, p, append(lines, "garbage"))
-	e := Event{TS: t0, Agent: "codex", Origin: "live", Kind: KindOther}
-	if err := AppendLive(p, &e, ""); err == nil {
-		t.Fatal("appending after a corrupt tail would fork the chain silently")
+	// a writer killed mid-record leaves half a line and no newline
+	torn := strings.Join(lines, "\n") + "\n" + lines[1][:len(lines[1])/2]
+	if err := os.WriteFile(p, []byte(torn), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	e := Event{TS: t0, Agent: "codex", Origin: "live", Kind: KindOther, Text: "after the crash"}
+	err := AppendLive(p, &e, "")
+	var resumed *ChainResumedError
+	if !errors.As(err, &resumed) {
+		t.Fatalf("recording must resume after a torn tail and say so, got %v", err)
+	}
+	e2 := Event{TS: t0, Agent: "codex", Origin: "live", Kind: KindOther, Text: "later"}
+	if err := AppendLive(p, &e2, ""); err != nil {
+		t.Fatalf("appends after the resumed record must be normal: %v", err)
+	}
+	evs, rep := ReadLiveLog(p)
+	if rep.OK() || rep.Status != ChainInvalid {
+		t.Fatalf("the torn line must stay visible to verification: %+v", rep)
+	}
+	if len(evs) != 4 || evs[2].Text != "after the crash" || evs[2].PrevHash != TornTailPrevHash || evs[3].PrevHash != evs[2].Hash {
+		t.Fatalf("records after the tear not chained as expected: %+v", evs)
+	}
+}
+
+func TestHookReportsResumedChain(t *testing.T) {
+	home := isolate(t)
+	logp := os.Getenv("AFR_LOG")
+	writeFile(t, logp, `{"half a rec`)
+	r := hook(t, home, "claude-code", `{"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"x"}`)
+	mustContain(t, r.Stderr, "recording resumed")
+	mustNotContain(t, r.Stderr, "recording failed")
 }
 
 func TestCheckpointParsing(t *testing.T) {

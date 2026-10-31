@@ -33,6 +33,13 @@
     Ticket or incident number, stamped into the manifest.
 .PARAMETER IncludeRaw
     Also copy raw unredacted source files. SOC only; the bundle will contain secrets.
+.PARAMETER ProfileDir
+    Collect this profile folder directly instead of resolving -User under
+    <SystemDrive>\Users (testing, or profiles stored elsewhere).
+.PARAMETER OutDir
+    Where bundles are written. Default: ProgramData\AgentFlightRecorder\collections.
+.PARAMETER AfrPath
+    Use this afr.exe instead of searching the default locations.
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +48,10 @@ param(
     [string]$Margin = "2h",
     [string]$Last,
     [string]$Case,
-    [switch]$IncludeRaw
+    [switch]$IncludeRaw,
+    [string]$ProfileDir,
+    [string]$OutDir = (Join-Path $env:ProgramData "AgentFlightRecorder\collections"),
+    [string]$AfrPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,22 +61,23 @@ $candidates = @(
     "$env:ProgramData\Microsoft\Windows Defender Advanced Threat Protection\Downloads\afr.exe",
     (Join-Path $PSScriptRoot "afr.exe")
 )
+if ($AfrPath) { $candidates = @($AfrPath) }
 $afr = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 if (-not $afr) { throw "afr.exe not found. Upload it first with: putfile afr.exe" }
 
-if (-not $User) {
+if (-not $User -and -not $ProfileDir) {
     $owner = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
         ForEach-Object { (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User } |
         Select-Object -First 1
     $User = $owner
 }
-$profiles = if ($User) { @(Join-Path $env:SystemDrive "Users\$User") } else {
+$profiles = if ($ProfileDir) { @($ProfileDir) } elseif ($User) { @(Join-Path $env:SystemDrive "Users\$User") } else {
     Get-ChildItem (Join-Path $env:SystemDrive "Users") -Directory |
         Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") } |
         ForEach-Object { $_.FullName }
 }
 
-$outDir = Join-Path $env:ProgramData "AgentFlightRecorder\collections"
+$outDir = $OutDir
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $exitCode = 0

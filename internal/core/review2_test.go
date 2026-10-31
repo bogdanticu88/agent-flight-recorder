@@ -19,7 +19,7 @@ func rightsFromACE(t *testing.T, script, principal string) map[string]bool {
 	re := regexp.MustCompile(`"` + regexp.QuoteMeta(principal) + `:((?:\([A-Z]+\))*)\(([A-Z,]+)\)"`)
 	m := re.FindStringSubmatch(script)
 	if m == nil {
-		t.Fatalf("no grant for %s in Install-AFR.ps1", principal)
+		t.Fatalf("no grant for %s in Install-AFR.ps1 (grants must use SIDs so they work on localized Windows)", principal)
 	}
 	out := map[string]bool{}
 	for _, r := range strings.Split(m[2], ",") {
@@ -35,7 +35,7 @@ func TestLogACLGrantsWhatTheRecorderRequests(t *testing.T) {
 	}
 	s := string(b)
 	need := append(append([]string{}, LogReadRights...), LogAppendRights...)
-	for _, p := range []string{"CREATOR OWNER", "OWNER RIGHTS"} {
+	for _, p := range []string{"*S-1-3-0", "*S-1-3-4"} { // CREATOR OWNER, OWNER RIGHTS
 		got := rightsFromACE(t, s, p)
 		for _, r := range need {
 			if !got[r] {

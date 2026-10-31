@@ -43,11 +43,27 @@
 .PARAMETER OnPolicyError
     "allow" (default) or "deny": what pre-tool calls get if the machine
     policy cannot be read or does not validate.
+.PARAMETER ProgramDir
+    Where afr.exe goes. Default: Program Files\AgentFlightRecorder.
+.PARAMETER DataDir
+    Policy and central log folder. Default: ProgramData\AgentFlightRecorder,
+    which is the only location afr reads as the managed policy. Any other
+    value is for isolated testing: the ACLs are applied, but the policy
+    written there is not the one afr enforces.
+.PARAMETER ProfilesRoot
+    Folder whose subfolders are user profiles. Default: <SystemDrive>\Users.
+.PARAMETER SkipMachineHooks
+    Do not write machine-scope hook files (Copilot policy.d, Claude Code
+    managed settings). Use for isolated testing.
 #>
 [CmdletBinding()]
 param(
     [string]$Source = $PSScriptRoot,
-    [ValidateSet("allow", "deny")][string]$OnPolicyError = "allow"
+    [ValidateSet("allow", "deny")][string]$OnPolicyError = "allow",
+    [string]$ProgramDir = (Join-Path $env:ProgramFiles "AgentFlightRecorder"),
+    [string]$DataDir = (Join-Path $env:ProgramData "AgentFlightRecorder"),
+    [string]$ProfilesRoot = (Join-Path $env:SystemDrive "Users"),
+    [switch]$SkipMachineHooks
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,25 +76,29 @@ function Invoke-Checked {
     if ($code -ne 0) { throw "$What failed with exit code $code" }
 }
 
-$dest = Join-Path $env:ProgramFiles "AgentFlightRecorder"
+$dest = $ProgramDir
 $exe = Join-Path $dest "afr.exe"
-$data = Join-Path $env:ProgramData "AgentFlightRecorder"
+$data = $DataDir
 $logs = Join-Path $data "logs"
 
 New-Item -ItemType Directory -Force -Path $dest, $data, $logs | Out-Null
 Copy-Item (Join-Path $Source "afr.exe") $exe -Force
 Invoke-Checked "afr version check" { & $exe version }
 
+# Well-known SIDs, so the grants work on every Windows display language:
+# S-1-5-18 SYSTEM, S-1-5-32-544 Administrators, S-1-5-32-545 Users,
+# S-1-3-0 CREATOR OWNER, S-1-3-4 OWNER RIGHTS.
+
 # Program Files and the policy folder: users read, only admins write.
-Invoke-Checked "icacls $data" { icacls $data /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" }
+Invoke-Checked "icacls $data" { icacls $data /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" }
 
 # Central log folder, permissions as described above.
 Invoke-Checked "icacls $logs" {
     icacls $logs /inheritance:r /grant:r `
-        "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" `
-        "Users:(RD,WD,X,RA,REA,RC,S)" `
-        "CREATOR OWNER:(OI)(IO)(RD,AD,RA,REA,RC,S)" `
-        "OWNER RIGHTS:(OI)(IO)(RD,AD,RA,REA,RC,S)"
+        "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+        "*S-1-5-32-545:(RD,WD,X,RA,REA,RC,S)" `
+        "*S-1-3-0:(OI)(IO)(RD,AD,RA,REA,RC,S)" `
+        "*S-1-3-4:(OI)(IO)(RD,AD,RA,REA,RC,S)"
 }
 
 # Machine policy. log_path sends every user's events to the central folder.
@@ -92,11 +112,13 @@ if (Test-Path $policySrc) {
 Set-Content (Join-Path $data "on-policy-error") $OnPolicyError -Encoding ASCII -NoNewline
 
 # Machine-scope hooks (cannot be removed by the user)
-Invoke-Checked "machine hook install" { & $exe install --bin $exe --scope machine --agents "copilot,claude-code" --apply }
+if (-not $SkipMachineHooks) {
+    Invoke-Checked "machine hook install" { & $exe install --bin $exe --scope machine --agents "copilot,claude-code" --apply }
+}
 
 # User-scope hooks in every profile
 $failed = @()
-Get-ChildItem (Join-Path $env:SystemDrive "Users") -Directory |
+Get-ChildItem $ProfilesRoot -Directory |
     Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") } |
     ForEach-Object {
         Write-Output "== $($_.FullName)"
