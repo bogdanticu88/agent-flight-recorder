@@ -16,8 +16,14 @@ var funcs = template.FuncMap{
 	},
 	"kl":    kindLabel,
 	"short": func(s string, n int) string { return Truncate(strings.TrimSpace(s), n) },
-	"inc":   func(i int) int { return i + 1 },
-	"join":  strings.Join,
+	"prefix": func(s string, n int) string {
+		if len(s) <= n {
+			return s
+		}
+		return s[:n] + "..."
+	},
+	"inc":  func(i int) int { return i + 1 },
+	"join": strings.Join,
 	"dur": func(a, b time.Time) string {
 		if a.IsZero() || b.IsZero() {
 			return ""
@@ -71,7 +77,7 @@ tr.hit{background:#fff4d6}tr.alert{background:#fde8ea}.finding{border-left:4px s
 {{range .Bundles}}<h2>Bundle: <code>{{.Path}}</code></h2><div class="card"><table class="meta">
 <tr><td>Checksum consistency</td><td>{{if .Check.ChecksumConsistent}}<span class="ok">Every entry matches the SHA-256 recorded in the manifest.</span>{{else}}<span class="bad">Not consistent.</span>{{end}}{{range .Check.Problems}}<div class="bad small">{{.}}</div>{{end}}</td></tr>
 <tr><td>Parsing completeness</td><td>{{if .Check.ParseIssues}}<span class="bad">{{.Check.ParseIssues}} source(s) with errors, malformed records or generic fallback</span> (see Artifacts examined){{else}}No parse errors recorded by the collector.{{end}}{{if .Manifest}}{{if eq .Manifest.Status "partial"}} <span class="bad">Collection was partial.</span>{{end}}{{end}}</td></tr>
-<tr><td>Live log in bundle</td><td>{{with .Check.Live}}{{.Status}}: {{.Detail}}{{else}}none{{end}}{{with .Check.LiveCollector}}<div class="small mut">Collector-reported status of the original log at collection time (not re-verifiable from this bundle unless the full log is included): {{.Status}}, {{.Records}} record(s), head {{short .HeadHash 16}}</div>{{end}}</td></tr>
+<tr><td>Live log in bundle</td><td>{{with .Check.Live}}{{.Status}}: {{.Detail}}{{else}}none{{end}}{{with .Check.LiveCollector}}<div class="small mut">Collector-reported status of the original log at collection time (not re-verifiable from this bundle unless the full log is included): {{.Status}}, {{.Records}} record(s), head {{prefix .HeadHash 16}}</div>{{end}}</td></tr>
 <tr><td>Origin</td><td class="small">{{.Check.Origin}}</td></tr>
 {{with .Manifest}}<tr><td>Collection mode</td><td><b>{{.Mode}}</b>. {{.ModeNote}}</td></tr>
 <tr><td>Case / host / user</td><td>{{if .CaseID}}{{.CaseID}}{{else}}(none){{end}} / {{if .SourceHost}}{{.SourceHost}}{{else}}(unknown){{end}} / {{.ProfileUser}} <span class="small mut">(collected on {{.Host}} as {{.User}}, {{.OS}})</span></td></tr>
@@ -114,13 +120,13 @@ tr.hit{background:#fff4d6}tr.alert{background:#fde8ea}.finding{border-left:4px s
 <div class="small mut">session {{if .SessionID}}{{.SessionID}}{{else}}<b>none recorded</b>{{end}}{{if .Host}} · host {{.Host}}{{end}}{{if .User}} · user {{.User}}{{end}}{{if .Cwd}} · cwd <code>{{.Cwd}}</code>{{end}}{{if .Model}} · model {{.Model}}{{end}}<br>{{.Prov}}{{if .Source}} · <code>{{.Source}}</code>{{end}}</div>
 <table><tr><th>#</th><th>Time (UTC)</th><th>Step</th><th>Tool</th><th>Outcome / status</th><th>Detail</th></tr>
 {{range $i, $e := .Steps}}<tr class="{{if hit $s.Hits $i}}hit{{end}}{{if $e.Decision}} alert{{end}}"><td class="small">{{$e.Pos}}</td><td class="small">{{ts $e.TS}}{{if $e.TSInexact}}*{{end}}</td>
-<td><span class="badge k-{{$e.Kind}}">{{kl $e.Kind}}</span>{{if $e.Decision}} <b class="bad">{{$e.Decision}}</b>{{end}}</td><td><code>{{$e.Tool}}</code>{{if $e.CallID}}<div class="small mut">{{short $e.CallID 24}}</div>{{end}}</td>
+<td><span class="badge k-{{$e.Kind}}">{{kl $e.Kind}}</span>{{if $e.Decision}} <b class="bad">{{$e.Decision}}</b>{{end}}</td><td><code>{{$e.Tool}}</code>{{if $e.CallID}}<div class="small mut">{{prefix $e.CallID 24}}</div>{{end}}</td>
 <td class="small">{{if $e.Outcome}}<b>{{$e.Outcome}}</b>{{end}}{{if $e.Status}}{{$e.Status}}{{end}}</td>
 <td>{{if $e.Command}}<code>$ {{short $e.Command 400}}</code><br>{{end}}{{if and $e.Input (not $e.Command)}}<code class="small">{{short $e.Input 400}}</code><br>{{end}}{{if $e.Text}}<details><summary class="small mut">{{short $e.Text 160}}</summary><pre>{{short $e.Text 8000}}</pre></details>{{end}}{{if $e.Error}}<div class="small bad">{{short $e.Error 400}}</div>{{end}}{{if $e.Reason}}<div class="small mut">{{$e.Reason}}</div>{{end}}<div class="small mut">{{$e.SourceRef}}</div></td></tr>{{end}}
 </table></details></div>{{end}}
 
 {{if .Sources}}<h2>Artifacts examined</h2><div class="card"><table><tr><th>Agent</th><th>Parser</th><th>Path</th><th>Steps</th><th>SHA-256</th><th>Notes</th></tr>
-{{range .Sources}}<tr><td>{{.Agent}}</td><td class="small">{{.Parser}}</td><td class="small"><code>{{.Path}}</code>{{if .Files}}<div class="mut">{{len .Files}} file(s) acquired</div>{{end}}</td><td>{{.Events}}</td><td class="small"><code>{{short .SHA256 16}}</code></td><td class="small">{{.Note}}{{if .Malformed}} <span class="bad">{{.Malformed}} malformed record(s)</span>{{end}}{{range .Diags}}<div class="mut">{{.}}</div>{{end}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td></tr>{{end}}</table></div>{{end}}
+{{range .Sources}}<tr><td>{{.Agent}}</td><td class="small">{{.Parser}}</td><td class="small"><code>{{.Path}}</code>{{if .Files}}<div class="mut">{{len .Files}} file(s) acquired</div>{{end}}</td><td>{{.Events}}</td><td class="small"><code>{{prefix .SHA256 16}}</code></td><td class="small">{{.Note}}{{if .Malformed}} <span class="bad">{{.Malformed}} malformed record(s)</span>{{end}}{{range .Diags}}<div class="mut">{{.}}</div>{{end}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td></tr>{{end}}</table></div>{{end}}
 
 <p class="small mut">* timestamp inherited from the previous step or the file, not recorded natively for this step. Outcomes come from vendor-recorded results matched by call ID; a successful result is not proof of every effect implied by a call's arguments. Reasoning shown is only what the model exposed.</p>
 </main></body></html>`
