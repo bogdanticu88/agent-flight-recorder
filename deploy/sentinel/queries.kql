@@ -4,25 +4,31 @@
 // AgentFlightRecorder_CL (see deploy/sentinel/README.md for the DCR).
 // ---------------------------------------------------------------------------
 
-// 1. Analytic rule: an AI agent touched a protected path (honeypot or secret)
+// 1. Analytic rule: an AI agent's tool call matched a protected-path rule.
+//    "deny" means the call was blocked before it ran; "alert" means it was
+//    allowed. Neither proves what the tool actually did.
 AgentFlightRecorder_CL
 | where decision in ("alert", "deny")
 | project TimeGenerated, host, user, agent, session_id, tool, decision, reason, paths, command, cwd
 
-// 2. Everything one agent session did, in order (paste the session_id from the alert)
+// 2. Everything one agent session did (paste host, user and session_id from the alert)
 AgentFlightRecorder_CL
-| where session_id == "<session_id>"
-| order by ts asc, seq asc
+| where host == "<host>" and user == "<user>" and session_id == "<session_id>"
+| order by ts asc
 | project ts, kind, tool, command, input, text, decision, reason
 
-// 3. The prompt the human gave before an alert (last prompt in the same session)
-let alerts = AgentFlightRecorder_CL | where decision in ("alert", "deny") | project alert_ts = ts, session_id, host, tool, reason;
+// 3. The prompt the human gave before an alert: the last prompt in the SAME
+//    session on the SAME host, user and agent. Joining on session_id alone
+//    can attach another machine's or another agent's prompt to the alert.
+let alerts = AgentFlightRecorder_CL
+    | where decision in ("alert", "deny")
+    | project alert_ts = ts, host, user, agent, session_id, tool, reason;
 AgentFlightRecorder_CL
-| where kind == "prompt"
-| join kind=inner alerts on session_id
+| where kind == "prompt" and isnotempty(session_id)
+| join kind=inner alerts on host, user, agent, session_id
 | where ts <= alert_ts
-| summarize arg_max(ts, text) by session_id, host, alert_ts, tool, reason
-| project alert_ts, host, session_id, prompt = text, tool, reason
+| summarize arg_max(ts, text) by host, user, agent, session_id, alert_ts, tool, reason
+| project alert_ts, host, user, agent, session_id, prompt = text, tool, reason
 
 // 4. Correlate an MDE honeypot hit with agent activity on the same device.
 //    Agent built-in file tools run inside the editor process, not a shell, so

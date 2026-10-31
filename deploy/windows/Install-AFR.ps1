@@ -5,25 +5,56 @@
 .DESCRIPTION
     Runs as SYSTEM. Steps:
       1. copies afr.exe to Program Files
-      2. creates a central log folder that users can append to (for the
-         Azure Monitor Agent to ship to Sentinel)
-      3. writes the machine policy (honeypot alert rules, secret deny rules)
+      2. creates a central log folder (see "Log folder permissions" below)
+      3. writes the machine policy and the on-policy-error marker
       4. installs machine-scope hook config where the vendor supports it
          (Copilot policy.d, Claude Code managed settings)
       5. installs user-scope hook config into every existing profile for
          agents that only read user config (VS Code, Cursor, Gemini, Codex, OpenCode)
 
-    Re-running is safe: afr replaces its own hook entries and keeps anything else.
-    New profiles created later need step 5 again (schedule this script or use
-    an Intune remediation).
+    Every native command is checked; the script stops on the first failure
+    and exits non-zero, so a deployment tool reports it as failed.
+
+    Re-running is safe: afr replaces only hook handlers it recognises as its
+    own and keeps everything else. New profiles created later need step 5
+    again (schedule this script or use an Intune remediation).
+
+    Log folder permissions (NOT VERIFIED on a real Windows host by this
+    project; test as a standard user before relying on them):
+      - SYSTEM and Administrators: full control.
+      - Users, on the folder only: create files, list, read attributes.
+        No delete-child, so users cannot delete or rename other files.
+      - Files a user creates: owner may read and append data. No write-data
+        (no overwrite or truncate), no delete. "OWNER RIGHTS" caps the
+        owner's implicit right to change the file's permissions.
+    Known gaps: a user can create a file under another user's name before
+    that user does (the victim's hook then cannot append and reports the
+    failure); local administrators can do anything; a user can still remove
+    or edit the hook configuration in their own profile for user-scope
+    agents. Ship the log to Sentinel and treat that copy as authoritative.
 
 .PARAMETER Source
     Folder containing afr.exe and policy.json (defaults to the script folder).
+.PARAMETER OnPolicyError
+    "allow" (default) or "deny": what pre-tool calls get if the machine
+    policy cannot be read or does not validate.
 #>
 [CmdletBinding()]
-param([string]$Source = $PSScriptRoot)
+param(
+    [string]$Source = $PSScriptRoot,
+    [ValidateSet("allow", "deny")][string]$OnPolicyError = "allow"
+)
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-Checked {
+    param([string]$What, [scriptblock]$Command)
+    $out = & $Command 2>&1
+    $code = $LASTEXITCODE
+    $out | ForEach-Object { Write-Output "   $_" }
+    if ($code -ne 0) { throw "$What failed with exit code $code" }
+}
+
 $dest = Join-Path $env:ProgramFiles "AgentFlightRecorder"
 $exe = Join-Path $dest "afr.exe"
 $data = Join-Path $env:ProgramData "AgentFlightRecorder"
@@ -31,12 +62,19 @@ $logs = Join-Path $data "logs"
 
 New-Item -ItemType Directory -Force -Path $dest, $data, $logs | Out-Null
 Copy-Item (Join-Path $Source "afr.exe") $exe -Force
+Invoke-Checked "afr version check" { & $exe version }
 
-# Central log folder. Users may create and append to files but not delete
-# them; CREATOR OWNER gets modify on its own files so the lock file works.
-# Test this ACL in your estate before rollout.
-icacls $logs /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" `
-    "Users:(CI)(WD,AD,RD,X,RA,REA)" "CREATOR OWNER:(OI)(CI)(IO)M" | Out-Null
+# Program Files and the policy folder: users read, only admins write.
+Invoke-Checked "icacls $data" { icacls $data /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" }
+
+# Central log folder, permissions as described above.
+Invoke-Checked "icacls $logs" {
+    icacls $logs /inheritance:r /grant:r `
+        "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" `
+        "Users:(RD,WD,X,RA,REA,RC)" `
+        "CREATOR OWNER:(OI)(IO)(RD,AD,RA,REA,RC)" `
+        "OWNER RIGHTS:(OI)(IO)(RD,AD,RA,REA,RC)"
+}
 
 # Machine policy. log_path sends every user's events to the central folder.
 $policyDst = Join-Path $data "policy.json"
@@ -46,15 +84,21 @@ if (Test-Path $policySrc) {
 } elseif (-not (Test-Path $policyDst)) {
     @{ log_path = "$logs\%USERNAME%.jsonl"; rules = @() } | ConvertTo-Json | Set-Content $policyDst -Encoding UTF8
 }
-icacls $policyDst /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" "Users:R" | Out-Null
+Set-Content (Join-Path $data "on-policy-error") $OnPolicyError -Encoding ASCII -NoNewline
 
 # Machine-scope hooks (cannot be removed by the user)
-& $exe install --bin $exe --scope machine --agents "copilot,claude-code" --apply
+Invoke-Checked "machine hook install" { & $exe install --bin $exe --scope machine --agents "copilot,claude-code" --apply }
 
 # User-scope hooks in every profile
+$failed = @()
 Get-ChildItem (Join-Path $env:SystemDrive "Users") -Directory |
     Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") } |
     ForEach-Object {
         Write-Output "== $($_.FullName)"
         & $exe install --bin $exe --home $_.FullName --scope user --apply
+        if ($LASTEXITCODE -ne 0) { $failed += $_.FullName }
     }
+if ($failed.Count -gt 0) {
+    throw "user-scope install failed for: $($failed -join ', ')"
+}
+Write-Output "afr installed. Log folder ACL is unverified; test it as a standard user."

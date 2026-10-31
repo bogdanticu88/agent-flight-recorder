@@ -16,6 +16,10 @@
 
     Can also be run by a user or admin directly in PowerShell.
 
+    Exit code: 0 all bundles complete, 3 at least one partial bundle,
+    1 any collection failed. BUNDLE lines are printed only for bundles whose
+    hash matches their sidecar.
+
 .PARAMETER User
     Profile folder name under C:\Users. Default: the user owning explorer.exe
     (the interactive user), or every profile if none is logged on.
@@ -65,8 +69,9 @@ $profiles = if ($User) { @(Join-Path $env:SystemDrive "Users\$User") } else {
 $outDir = Join-Path $env:ProgramData "AgentFlightRecorder\collections"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
+$exitCode = 0
 foreach ($profileDir in $profiles) {
-    if (-not (Test-Path $profileDir)) { Write-Warning "profile not found: $profileDir"; continue }
+    if (-not (Test-Path $profileDir)) { Write-Warning "profile not found: $profileDir"; $exitCode = 1; continue }
     $name = Split-Path $profileDir -Leaf
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
     $bundle = Join-Path $outDir "afr-$env:COMPUTERNAME-$name-$stamp.zip"
@@ -78,9 +83,31 @@ foreach ($profileDir in $profiles) {
 
     Write-Output "== collecting $profileDir"
     & $afr @afrArgs 2>&1 | ForEach-Object { Write-Output "   $_" }
-    if (Test-Path $bundle) {
-        $hash = (Get-FileHash $bundle -Algorithm SHA256).Hash.ToLower()
-        Write-Output "BUNDLE: $bundle"
-        Write-Output "SHA256: $hash"
+    $code = $LASTEXITCODE
+    # afr exit codes: 0 complete, 3 partial (bundle written, some sources failed), anything else failed
+    if ($code -ne 0 -and $code -ne 3) {
+        Write-Output "FAILED: collection of $profileDir exited with $code; no usable bundle"
+        $exitCode = 1
+        continue
     }
+    $sidecar = "$bundle.sha256"
+    if (-not (Test-Path $bundle) -or -not (Test-Path $sidecar)) {
+        Write-Output "FAILED: afr reported success but the bundle or its .sha256 is missing"
+        $exitCode = 1
+        continue
+    }
+    $hash = (Get-FileHash $bundle -Algorithm SHA256).Hash.ToLower()
+    $expected = ((Get-Content $sidecar -Raw) -split '\s+')[0]
+    if ($hash -ne $expected) {
+        Write-Output "FAILED: bundle hash $hash does not match its sidecar $expected"
+        $exitCode = 1
+        continue
+    }
+    if ($code -eq 3) {
+        Write-Output "PARTIAL: some sources could not be collected; see sources.json in the bundle"
+        if ($exitCode -eq 0) { $exitCode = 3 }
+    }
+    Write-Output "BUNDLE: $bundle"
+    Write-Output "SHA256: $hash"
 }
+exit $exitCode

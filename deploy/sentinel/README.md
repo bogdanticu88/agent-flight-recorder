@@ -6,8 +6,9 @@ The hook recorder writes one JSON object per line. With the machine policy from
 Agent (AMA) picks those files up and sends them to a custom table.
 
 The local file is the working copy. The Sentinel copy is the record you trust.
-A user can delete their own local log, but by then AMA has normally shipped it.
-The hash chain shows gaps or edits in whatever is left on disk.
+The hash chain is unkeyed: it shows whether what is left on disk is internally
+consistent, not whether records were removed from the end or the chain was
+rebuilt. Records already shipped to Sentinel are an independent copy.
 
 ## 1. Create the table
 
@@ -19,12 +20,13 @@ named `AgentFlightRecorder_CL` with these columns (all `string` unless noted):
 | TimeGenerated | datetime | set from `ts` in the transform |
 | ts | datetime | when the step happened |
 | agent, origin, session_id, kind, tool, call_id | string | |
+| status, error | string | vendor-reported result status on tool results |
 | text, input, command, cwd, model | string | already redacted on the device |
 | paths | dynamic | array of file paths |
 | decision, reason | string | `alert` / `deny` and the matching rule |
 | source, source_ref | string | hook event name and vendor transcript path |
 | host, user | string | |
-| seq | int | |
+| seq | int | 0 for live records |
 | prev_hash, hash | string | tamper-evidence chain |
 
 ## 2. Create the data collection rule
@@ -46,11 +48,14 @@ Associate the DCR with the device collection that received `Install-AFR.ps1`.
 
 `queries.kql` has the analytic rule for protected-path hits, the session
 replay query, the "what was the prompt" join and the correlation with
-`DeviceFileEvents` for the honeypot.
+`DeviceFileEvents` for a canary file. Session IDs are only unique per agent
+on one host for one user, so every join and filter uses host, user, agent
+and session_id together.
 
 ## 4. Ticketing
 
 If Sentinel already raises tickets in your ITSM tool (ServiceNow, Jira),
 add the output of query 3 (the prompt and the tool call) to the incident
-entities. The analyst then opens the ticket with the answer already in it,
-instead of starting from "user touched a canary file".
+entities, so the analyst starts with the recorded context rather than just
+"user touched a canary file". The decision field says whether the call was
+allowed or blocked; it does not say what the tool did.
