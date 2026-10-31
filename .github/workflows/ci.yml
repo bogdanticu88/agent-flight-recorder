@@ -19,6 +19,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: gofmt
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l .; exit 1)
@@ -29,19 +32,27 @@ jobs:
       - name: race
         if: runner.os != 'Windows'
         run: go test -race ./...
+      - name: cross-compile check
+        if: runner.os == 'Linux'
+        run: |
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
       - name: build
         run: go build -o afr${{ runner.os == 'Windows' && '.exe' || '' }} .
       - name: fixture workflow
         shell: bash
+        env:
+          EXE: ${{ runner.os == 'Windows' && '.exe' || '' }}
         run: |
           set -euo pipefail
+          AFR="./afr$EXE"
           F="$RUNNER_TEMP/fixtures"
-          python3 testdata/gen_fixtures.py "$F"
+          python testdata/gen_fixtures.py "$F"
           export AFR_LOG="$RUNNER_TEMP/none.jsonl"
-          ./afr collect --home "$F/home/dev" --workspace "$F/src/acme-sdk" --around 2026-10-29T13:44:00Z --margin 1h -o "$RUNNER_TEMP/demo.zip"
-          ./afr verify "$RUNNER_TEMP/demo.zip"
-          ./afr report "$RUNNER_TEMP/demo.zip" --trace .aws/credentials -o "$RUNNER_TEMP/report.html"
-          python3 -c "import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); sys.exit(0 if any(n.startswith('workspace/') and n.endswith('AGENTS.md') for n in names) else 1)" "$RUNNER_TEMP/demo.zip"
+          "$AFR" collect --home "$F/home/dev" --workspace "$F/src/acme-sdk" --around 2026-10-29T13:44:00Z --margin 1h -o "$RUNNER_TEMP/demo.zip"
+          "$AFR" verify "$RUNNER_TEMP/demo.zip"
+          "$AFR" report "$RUNNER_TEMP/demo.zip" --trace .aws/credentials -o "$RUNNER_TEMP/report.html"
+          python -c "import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); sys.exit(0 if any(n.startswith('workspace/') and n.endswith('AGENTS.md') for n in names) else 1)" "$RUNNER_TEMP/demo.zip"
       - name: parse PowerShell scripts
         if: runner.os == 'Windows'
         shell: pwsh

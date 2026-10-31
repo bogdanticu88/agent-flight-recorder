@@ -29,7 +29,7 @@ Offline (after an incident):
   afr collect  [--around TIME --margin 2h | --from TIME --to TIME | --last 24h]
                [--agents all|copilot-vscode,claude-code,...] [--mode soc|user]
                [--case INC0012345] [--home DIR] [--root IMAGE --source-host NAME]
-               [--workspace DIR] [--include-raw] [--full-live-log] [-o FILE]
+               [--workspace DIR] [--live-log PATH] [--include-raw] [--full-live-log] [-o FILE]
   afr report   BUNDLE.zip|events.jsonl ... [--trace PATH]... [-o report.html]
   afr verify   BUNDLE.zip|events.jsonl ... [--checkpoint RECORDS:HASH]
   afr checkpoint LOG.jsonl
@@ -138,6 +138,7 @@ func cmdCollect(args []string) int {
 	raw := fs.Bool("include-raw", false, "also copy raw, UNREDACTED source files (SOC only)")
 	fullLive := fs.Bool("full-live-log", false, "include the WHOLE live log, not just records in the window (privacy: exports activity outside the incident)")
 	noRedact := fs.Bool("no-redact", false, "disable secret redaction (not recommended)")
+	liveLog := fs.String("live-log", "", "live log to include (default: the managed policy's log_path, else the profile's default location)")
 	out := fs.String("o", "", "output bundle path (default afr-<host>-<time>.zip)")
 	var ws multi
 	fs.Var(&ws, "workspace", "extra workspace folder whose agent instruction files to capture (repeatable)")
@@ -158,7 +159,7 @@ func cmdCollect(args []string) int {
 		roots = core.RootsFor(mapped)
 	}
 	o := core.CollectOptions{Roots: roots, Root: *root, SourceHost: *srcHost, Agents: agentSet(*agents), Mode: *mode, CaseID: *caseID,
-		IncludeRaw: *raw, FullLiveLog: *fullLive, NoRedact: *noRedact, Workspaces: ws, Log: os.Stderr}
+		IncludeRaw: *raw, FullLiveLog: *fullLive, LiveLog: *liveLog, NoRedact: *noRedact, Workspaces: ws, Log: os.Stderr}
 	var err error
 	switch {
 	case *around != "":
@@ -440,7 +441,11 @@ func cmdVerify(args []string) int {
 		if !rep.OK() {
 			bad = true
 		}
-		fmt.Printf("%-8s %s (%d records)\n         %s\n", strings.ToUpper(rep.Status), p, rep.Records, rep.Detail)
+		label := strings.ToUpper(rep.Status)
+		if rep.Status == core.ChainExcerpt {
+			label = "EXCERPT" // never a pass on its own: completeness cannot be shown
+		}
+		fmt.Printf("%-8s %s (%d records)\n         %s\n", label, p, rep.Records, rep.Detail)
 		if rep.Checkpoint != "" {
 			fmt.Println("         checkpoint:", rep.Checkpoint)
 		}

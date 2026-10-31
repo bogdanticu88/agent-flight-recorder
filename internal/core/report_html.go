@@ -75,6 +75,8 @@ tr.hit{background:#fff4d6}tr.alert{background:#fde8ea}.finding{border-left:4px s
 </div>
 
 {{range .Bundles}}<h2>Bundle: <code>{{.Path}}</code></h2><div class="card"><table class="meta">
+<tr><td>Bundle SHA-256</td><td><code>{{.Check.BundleSHA256}}</code> <span class="small mut">compare with the value recorded when it was collected (for example in the ticket)</span></td></tr>
+<tr><td>Verification</td><td>{{if .Check.OK}}<span class="ok">passed</span>{{else}}<span class="bad">FAILED</span>{{end}}</td></tr>
 <tr><td>Checksum consistency</td><td>{{if .Check.ChecksumConsistent}}<span class="ok">Every entry matches the SHA-256 recorded in the manifest.</span>{{else}}<span class="bad">Not consistent.</span>{{end}}{{range .Check.Problems}}<div class="bad small">{{.}}</div>{{end}}</td></tr>
 <tr><td>Parsing completeness</td><td>{{if .Check.ParseIssues}}<span class="bad">{{.Check.ParseIssues}} source(s) with errors, malformed records or generic fallback</span> (see Artifacts examined){{else}}No parse errors recorded by the collector.{{end}}{{if .Manifest}}{{if eq .Manifest.Status "partial"}} <span class="bad">Collection was partial.</span>{{end}}{{end}}</td></tr>
 <tr><td>Live log in bundle</td><td>{{with .Check.Live}}{{.Status}}: {{.Detail}}{{else}}none{{end}}{{with .Check.LiveCollector}}<div class="small mut">Collector-reported status of the original log at collection time (not re-verifiable from this bundle unless the full log is included): {{.Status}}, {{.Records}} record(s), head {{prefix .HeadHash 16}}</div>{{end}}</td></tr>
@@ -117,7 +119,7 @@ tr.hit{background:#fff4d6}tr.alert{background:#fde8ea}.finding{border-left:4px s
 <p class="small mut">One stream per input, source, host, user, agent and session ID. Streams are never merged, and positions (#) are local to their source. Timestamps from different sources are not used to infer an order between them.</p>
 {{range .Sessions}}{{$s := .}}<div class="card"><details {{if .Hits}}open{{end}}>
 <summary>{{.Agent}} <span class="mut">({{.Origin}})</span> · {{ts .Start}} {{with dur .Start .End}}· {{.}}{{end}} · {{len .Steps}} steps, {{.Tools}} tool calls{{if .Hits}} · <span class="bad">{{len .Hits}} trace hit(s)</span>{{end}}{{if .Alerts}} · <span class="bad">{{.Alerts}} alert(s)</span>{{end}}</summary>
-<div class="small mut">session {{if .SessionID}}{{.SessionID}}{{else}}<b>none recorded</b>{{end}}{{if .Host}} · host {{.Host}}{{end}}{{if .User}} · user {{.User}}{{end}}{{if .Cwd}} · cwd <code>{{.Cwd}}</code>{{end}}{{if .Model}} · model {{.Model}}{{end}}<br>{{.Prov}}{{if .Source}} · <code>{{.Source}}</code>{{end}}</div>
+<div class="small mut">session {{if .SessionID}}{{.SessionID}}{{else}}<b>none recorded</b>{{end}}{{if .Host}} · host {{.Host}}{{end}}{{if .User}} · user {{.User}}{{end}}{{if .Cwd}} · cwd <code>{{.Cwd}}</code>{{end}}{{if .Model}} · model {{.Model}}{{end}}<br>{{.Prov}}{{if .Source}} · <code>{{.Source}}</code>{{end}}{{range .Related}}<br>same session also recorded in: <code>{{.}}</code>{{end}}</div>
 <table><tr><th>#</th><th>Time (UTC)</th><th>Step</th><th>Tool</th><th>Outcome / status</th><th>Detail</th></tr>
 {{range $i, $e := .Steps}}<tr class="{{if hit $s.Hits $i}}hit{{end}}{{if $e.Decision}} alert{{end}}"><td class="small">{{$e.Pos}}</td><td class="small">{{ts $e.TS}}{{if $e.TSInexact}}*{{end}}</td>
 <td><span class="badge k-{{$e.Kind}}">{{kl $e.Kind}}</span>{{if $e.Decision}} <b class="bad">{{$e.Decision}}</b>{{end}}</td><td><code>{{$e.Tool}}</code>{{if $e.CallID}}<div class="small mut">{{prefix $e.CallID 24}}</div>{{end}}</td>

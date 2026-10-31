@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -27,6 +28,13 @@ import (
 // acquireHook, when set by tests, runs after each file is copied and before
 // it is re-checked, so tests can simulate a concurrent writer.
 var acquireHook func(path string)
+
+// beforeOpenHook, when set by tests, runs after the containment check and
+// just before a file is opened, so tests can swap a path for a symlink.
+var beforeOpenHook func(path string)
+
+// ErrOutsideRoots marks a path that resolves outside the acquisition roots.
+var ErrOutsideRoots = errors.New("outside the acquisition roots")
 
 // Scope limits which paths acquisition may read: everything under the
 // examined profile, explicit workspaces, and the image root when one is set.
@@ -74,7 +82,7 @@ func (s Scope) Check(p string) (string, os.FileInfo, error) {
 		}
 	}
 	if !ok {
-		return "", nil, fmt.Errorf("%s resolves to %s, outside the acquisition roots; not read", p, real)
+		return "", nil, fmt.Errorf("%s resolves to %s, %w; not read", p, real, ErrOutsideRoots)
 	}
 	st, err := os.Stat(real)
 	if err != nil {
@@ -103,15 +111,20 @@ func (s Scope) MapPath(p string) (string, error) {
 		}
 		return filepath.Clean(p), nil
 	}
+	var rel string
 	switch {
 	case strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, "//"):
 		return "", fmt.Errorf("UNC or device path %q cannot be mapped into the image", p)
 	case winDrive.MatchString(p):
-		return filepath.Join(s.Root, filepath.FromSlash(strings.ReplaceAll(p[3:], `\`, "/"))), nil
+		rel = strings.ReplaceAll(p[3:], `\`, "/")
 	case strings.HasPrefix(p, "/"):
-		return filepath.Join(s.Root, filepath.FromSlash(p)), nil
+		rel = p
+	default:
+		return "", fmt.Errorf("relative path %q has no defined location in the image", p)
 	}
-	return "", fmt.Errorf("relative path %q has no defined location in the image", p)
+	// Clean as a rooted path first, so ".." can never climb above the image root.
+	rel = path.Clean("/" + rel)
+	return filepath.Join(s.Root, filepath.FromSlash(rel)), nil
 }
 
 type statSig struct {
@@ -127,13 +140,38 @@ func sig(p string) (statSig, bool) {
 	return statSig{st.Size(), st.ModTime()}, true
 }
 
-// copyHash copies src to dst and returns the SHA-256 and byte count of what was written.
-func copyHash(src, dst string) (string, int64, error) {
+// copyHash copies src to dst and returns the SHA-256 and byte count of what
+// was written. With a scope, the file actually opened is checked after the
+// open: its path must still resolve inside the roots, and the resolved file
+// must be the same file (device and inode, or volume and file index) as the
+// open handle. A path swapped for a link between the containment check and
+// the open is therefore rejected rather than followed. Hard links to files
+// outside the roots are not detectable this way.
+func copyHash(src, dst string, scope *Scope) (string, int64, error) {
+	if beforeOpenHook != nil {
+		beforeOpenHook(src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return "", 0, err
 	}
 	defer in.Close()
+	if scope != nil {
+		opened, err := in.Stat()
+		if err != nil {
+			return "", 0, err
+		}
+		real, st, err := scope.Check(src)
+		if err != nil {
+			return "", 0, fmt.Errorf("after opening: %w", err)
+		}
+		if !os.SameFile(opened, st) {
+			return "", 0, fmt.Errorf("%s changed between the containment check and the open (now %s); not read", src, real)
+		}
+		if !opened.Mode().IsRegular() {
+			return "", 0, fmt.Errorf("%s is not a regular file; not read", src)
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", 0, err
 	}
@@ -155,7 +193,7 @@ func copyHash(src, dst string) (string, int64, error) {
 // acquireSet copies a group of files that must be read together (a SQLite
 // database with its -wal and -shm, or a single file). It retries while any
 // member changes during the copy. Missing optional members are skipped.
-func acquireSet(members []string, roles []string, dstDir string) ([]FileEvidence, []string, error) {
+func acquireSet(members []string, roles []string, dstDir string, scope *Scope) ([]FileEvidence, []string, error) {
 	const attempts = 3
 	var notes []string
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -177,7 +215,7 @@ func acquireSet(members []string, roles []string, dstDir string) ([]FileEvidence
 				}
 				continue
 			}
-			sum, n, err := copyHash(m, filepath.Join(dstDir, filepath.Base(m)))
+			sum, n, err := copyHash(m, filepath.Join(dstDir, filepath.Base(m)), scope)
 			if err != nil {
 				if i > 0 && errors.Is(err, fs.ErrNotExist) {
 					continue
@@ -207,13 +245,16 @@ func acquireSet(members []string, roles []string, dstDir string) ([]FileEvidence
 }
 
 // acquireDir copies every regular file under dir, without following links,
-// and returns per-file evidence. Links and special files are listed as skipped.
-func acquireDir(dir, dstDir string) ([]FileEvidence, []string, error) {
+// and returns per-file evidence. Links and special files are listed as
+// skipped; files that could not be read, or kept changing, are counted in
+// failed so the caller can mark the collection partial.
+func acquireDir(dir, dstDir string, scope *Scope) ([]FileEvidence, []string, int, error) {
 	var ev []FileEvidence
 	var notes []string
-	count := 0
+	count, failed := 0, 0
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			failed++
 			notes = append(notes, fmt.Sprintf("%s: %v", p, err))
 			return nil
 		}
@@ -229,19 +270,33 @@ func acquireDir(dir, dstDir string) ([]FileEvidence, []string, error) {
 		if count > maxDirFiles {
 			return fmt.Errorf("more than %d files under %s", maxDirFiles, dir)
 		}
-		fe, n2, err := acquireSet([]string{p}, []string{"child"}, filepath.Join(dstDir, filepath.Dir(rel)))
+		fe, n2, err := acquireSet([]string{p}, []string{"child"}, filepath.Join(dstDir, filepath.Dir(rel)), scope)
 		for _, n := range n2 {
 			notes = append(notes, rel+": "+n)
 		}
 		if err != nil {
+			failed++
 			notes = append(notes, fmt.Sprintf("%s: %v", rel, err))
 			return nil
+		}
+		if anyChanged(fe) {
+			failed++
 		}
 		ev = append(ev, fe...)
 		return nil
 	})
 	sort.Slice(ev, func(i, j int) bool { return ev[i].Path < ev[j].Path })
-	return ev, notes, err
+	return ev, notes, failed, err
+}
+
+// anyChanged reports whether any member was still changing on the last attempt.
+func anyChanged(fe []FileEvidence) bool {
+	for _, f := range fe {
+		if f.Changed {
+			return true
+		}
+	}
+	return false
 }
 
 // digestFiles is a stable digest over per-file evidence, used as the single

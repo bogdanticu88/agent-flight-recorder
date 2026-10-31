@@ -59,7 +59,7 @@ Every tool call gets an **outcome**, derived from the captured record:
 | `requested` | The call is recorded, but no result for it is |
 | `unknown` | A result exists but records no status, or the call has no ID so results can't be matched to it |
 
-Results are matched by call ID only. A result is never guessed from its position. For each trace target the report then separates:
+Results are matched by call ID only, within the same record stream, and only results recorded *after* the call count. A result is never guessed from its position. Anything ambiguous stays `unknown`: several calls sharing one ID, results reporting conflicting statuses, or a stream without a session ID. For each trace target the report then separates:
 
 - **First observed mention**: the earliest step where the target appears at all (prompt, injected context, tool result, reasoning).
 - **First request**: the first tool call involving it, and how: as a path argument, inside a shell command, in search terms, or only in a description.
@@ -67,7 +67,7 @@ Results are matched by call ID only. A result is never guessed from its position
 
 When the first request is also the first mention, the report says no earlier mention was observed in the available evidence, and that earlier context may not have been captured. It does not conclude that the agent came up with it unprompted.
 
-**Record streams are never merged.** Events are grouped by input (bundle or log), source file, host, user, agent and session ID. Events without a session ID are kept in their own stream and flagged as unscoped. Within a stream, order is the position in the source. Timestamps from different sources are not used to build a global order.
+**Record streams are never merged.** Events are grouped by input (bundle or log), source file, host, user, agent and session ID. Events without a session ID are kept in their own stream and flagged as unscoped. Within a stream, order is the position in the source. Timestamps from different sources are not used to build a global order. Streams that share host, user, agent and session ID (a subagent transcript, a second store, a repeated collection) are linked to each other in the report, and listed separately because their relative order isn't known.
 
 ## Offline workflow
 
@@ -100,9 +100,11 @@ sequenceDiagram
 8. **Exports the live log as a windowed excerpt** if the recorder is installed. Records inside the window are copied byte-for-byte with their original hashes, under a header recording the original log's hash, record count, head hash and chain status at collection time. Nothing is re-chained. `--full-live-log` includes the whole log instead, and prints a warning, because that exports activity unrelated to the incident.
 9. **Writes the bundle atomically**: a temp file, then fsync, then rename, then the `.sha256` sidecar. Any write failure is fatal and leaves no bundle behind.
 
-**Exit codes:** `0` complete; `3` partial (a valid bundle was written, but some sources could not be acquired or parsed; they are listed in `sources.json` and the manifest); `1` failed (no trustworthy bundle).
+**Exit codes:** `0` complete; `3` partial; `1` failed (no trustworthy bundle). A collection is partial, and the bundle says so, when any source could not be acquired or kept changing during acquisition, a directory child could not be read, any record was malformed, a workspace file in scope could not be read, or the live log was not a consistent chain. All of these are listed in `sources.json` and the manifest.
 
-**Acquisition roots.** The collector may run as SYSTEM while reading files the user controls. It reads only inside the examined profile, any `--workspace` folders, and the live log's own folder. Symlinks that resolve outside those roots, special files and anything a transcript points at elsewhere (a recorded `cwd` of `/etc` or another user's profile) are skipped and listed in the manifest under `skipped`.
+**Acquisition roots.** The collector may run as SYSTEM while reading files the user controls. It reads only inside the examined profile, any `--workspace` folders, and the live log's own folder. Symlinks, junctions and other reparse points that resolve outside those roots, special files, and anything a transcript points at elsewhere (a recorded `cwd` of `/etc` or another user's profile) are skipped and listed in the manifest under `skipped`. Containment is checked again after each file is opened: the path must still resolve inside the roots and identify the same file as the open handle. A path swapped for a link between the check and the open is therefore rejected rather than followed. **Not covered:** a hard link to a file outside the roots looks like an ordinary file inside them. Linux restricts this with `protected_hardlinks`, and on NTFS creating one needs write access to the target, but neither is checked here.
+
+**Live log location.** The collector reads the live log only from places the operator or administrator controls: `--live-log PATH`, otherwise the managed policy's `log_path`, otherwise the default per-user location inside the profile. The user's own policy file and environment variables are ignored, so a user can't point a SYSTEM collector at an arbitrary file.
 
 **Mounted images.** Use `--root /mnt/image --home 'C:\Users\jdoe' --source-host LAPTOP-7`. The home path and every `cwd` recorded in transcripts are mapped into the image: drive-letter paths become `root/Users/...` and POSIX paths become `root/home/...`. Paths that can't be mapped safely (relative paths, UNC) are skipped and listed, never resolved against the analysis machine's own filesystem.
 
@@ -119,7 +121,9 @@ sequenceDiagram
 
 Entry count and size limits (`--max-entries`, `--max-entry-bytes`, `--max-total-bytes`) protect the verifier from oversized or hostile zips.
 
-For a live log, `afr verify` distinguishes `missing`, `unreadable`, `empty`, `invalid` (malformed records), `broken` (a record doesn't match its hash or its link), `unanchored` (the first record points at a predecessor that isn't there, because earlier records were deleted or the log was rotated), `consistent`, and `excerpt`.
+For a live log, `afr verify` distinguishes `missing`, `unreadable`, `empty`, `invalid` (malformed records), `broken` (a record doesn't match its hash or its link), `unanchored` (the first record points at a predecessor that isn't there, because earlier records were deleted or the log was rotated), `consistent`, and `excerpt`. Only `consistent` and `empty` pass.
+
+**Excerpts never pass on their own.** In an excerpt, every included record matches its own hash, records must fall inside the window the header declares, and the header's record count must match. What an excerpt cannot show is whether records inside the window were left out, so a standalone excerpt exits `2`. Inside a bundle, an excerpt is accepted only where the manifest declares one. Even then, the bundle fails verification if the collector recorded the original log as anything other than consistent.
 
 **What the hash chain does and doesn't show.** The chain is unkeyed. It shows internal consistency: an edited, removed, inserted or reordered record in the middle breaks it. It cannot show that the newest records weren't removed from the end, or that someone who could rewrite the file didn't rebuild the whole chain. For that you need a checkpoint kept somewhere the writer can't change:
 
@@ -128,7 +132,7 @@ afr checkpoint events.jsonl              # prints RECORDS:HASH; store it in the 
 afr verify events.jsonl --checkpoint 1532:9f2c...
 ```
 
-The copy shipped to Sentinel serves the same purpose at scale.
+A checkpoint only detects deleted or rewritten records within the first RECORDS records it covers. Records appended later still verify. It must be checked only on a log that is consistent from its first record, and is reported as "not evaluated" otherwise. It is independent protection only if it was stored where the log's writer can't change it. A checkpoint saved next to a user-writable log protects nothing. The copy shipped to Sentinel serves the same purpose at scale.
 
 ## Live workflow
 
@@ -194,7 +198,7 @@ afr install --bin ... --os windows --emit ./package                          # w
 
 The installer merges into existing settings files. It removes only handlers whose command is exactly an afr hook invocation (an executable named `afr`/`afr.exe` or the configured binary, followed by `hook --agent NAME [--event NAME]` and nothing else). Within a matcher group it shares with the user, it keeps the user's handlers. It writes a `.afr-bak` backup and replaces files atomically. It refuses to touch a settings file it can't parse as a JSON object.
 
-For a Windows fleet, `deploy/windows/Install-AFR.ps1` runs as SYSTEM: it copies the binary, writes the managed policy and `on-policy-error`, sets folder permissions, installs machine-scope hooks where the vendor supports them and user-scope hooks into every profile, and stops with a non-zero exit code on the first failed native command. **Its log-folder permissions have not been tested as a standard Windows user.** The script header describes exactly what is granted and the known gaps: name-squatting of another user's log file, administrators, and user-editable user-scope hook configs. Ship the logs to Sentinel (`deploy/sentinel/README.md`) and treat that copy as authoritative.
+For a Windows fleet, `deploy/windows/Install-AFR.ps1` runs as SYSTEM: it copies the binary, writes the managed policy and `on-policy-error`, sets folder permissions, installs machine-scope hooks where the vendor supports them and user-scope hooks into every profile, and stops with a non-zero exit code on the first failed native command. The recorder opens its log on Windows with append and synchronize access only. A normal append-mode open also requests write-attributes, write-EA and read-control, which an append-only ACL refuses; that mismatch existed in an earlier build of this branch. **The log-folder permissions and this opener have not been tested on Windows as a standard user.** The script header describes exactly what is granted and the known gaps: name-squatting of another user's log file, administrators, and user-editable user-scope hook configs. Ship the logs to Sentinel (`deploy/sentinel/README.md`) and treat that copy as authoritative.
 
 ## What it reads (offline)
 
@@ -254,7 +258,8 @@ Pure Go with no cgo; SQLite is read with `modernc.org/sqlite`. CI (`.github/work
 
 - Bundles are format `afr-bundle` version 2. Bundles written by afr 0.1 (no `format` field) are rejected by `verify` and `report`. Re-collect them.
 - `collect` exports the live log as `live/excerpt.jsonl` (in-window records plus a header) by default. Use `--full-live-log` for the old behaviour (`live/events.jsonl`, whole log). Live records are no longer duplicated into `events.jsonl`.
-- `collect` exits `3` for partial collections. `verify` and `report` exit `2` when any input fails verification, and `verify` exits `1` with no inputs.
+- `collect` exits `3` for partial collections, now including malformed records, unstable sources and a live log that isn't a consistent chain. It reads the live log from `--live-log` or the managed policy only, never from the user's policy or `AFR_LOG`.
+- `verify` of a standalone excerpt exits `2`. `--checkpoint` requires a 64-hex hash. `verify` and `report` exit `2` when any input fails verification, and `verify` exits `1` with no inputs.
 - Live-log status names changed: `intact` is now `consistent`, with new `missing`, `unreadable`, `invalid`, `unanchored` and `excerpt` states. Existing logs still verify: new event fields are omitted when empty, so old record hashes are unchanged.
 - An invalid policy is now an error, not an empty policy. Unknown fields in a policy file are rejected. `AFR_POLICY` and `AFR_LOG` are ignored when a managed policy exists. `afr hook` rejects unknown `--agent` values.
 - Codex denies now use the documented `hookSpecificOutput` JSON instead of exit code 2. The Claude Code install adds `PostToolUseFailure`.

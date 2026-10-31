@@ -37,6 +37,7 @@ type CollectOptions struct {
 	Out         string    // bundle path (.zip)
 	IncludeRaw  bool      // also copy raw source files (unredacted). SOC use only.
 	FullLiveLog bool      // include the whole live log, not just the window
+	LiveLog     string    // operator-supplied live log path (overrides the default location)
 	NoRedact    bool
 	Mode        string // soc | user
 	CaseID      string
@@ -59,38 +60,39 @@ type LiveLogInfo struct {
 
 // Manifest describes a bundle: who/where/when, what was found, and hashes.
 type Manifest struct {
-	Format         string            `json:"format"`
-	FormatVersion  int               `json:"format_version"`
-	Tool           string            `json:"tool"`
-	Version        string            `json:"version"`
-	Status         string            `json:"status"` // complete | partial
-	CaseID         string            `json:"case_id,omitempty"`
-	Mode           string            `json:"mode"`
-	ModeNote       string            `json:"mode_note"`
-	Host           string            `json:"host"` // where the collector ran
-	User           string            `json:"user"` // who ran it
-	OS             string            `json:"os"`
-	Root           string            `json:"image_root,omitempty"`
-	Home           string            `json:"home"`
-	SourceHost     string            `json:"source_host,omitempty"` // host the evidence belongs to, if known
-	ProfileUser    string            `json:"profile_user"`
-	Started        time.Time         `json:"collection_started"`
-	Finished       time.Time         `json:"collection_finished"`
-	WindowFrom     *time.Time        `json:"window_from,omitempty"`
-	WindowTo       *time.Time        `json:"window_to,omitempty"`
-	Redacted       bool              `json:"redacted"`
-	RedactionCount int               `json:"redaction_count"`
-	RawIncluded    bool              `json:"raw_included"`
-	FullLiveLog    bool              `json:"full_live_log"`
-	Sources        int               `json:"sources_found"`
-	SourceErrors   int               `json:"source_errors"`
-	Events         int               `json:"events_in_window"`
-	Sessions       int               `json:"sessions_in_window"`
-	Agents         map[string]int    `json:"events_per_agent"`
-	LiveLog        *LiveLogInfo      `json:"live_log,omitempty"`
-	Skipped        []string          `json:"skipped,omitempty"`
-	Captures       []string          `json:"captures"`
-	Entries        map[string]string `json:"entry_sha256"`
+	Format           string            `json:"format"`
+	FormatVersion    int               `json:"format_version"`
+	Tool             string            `json:"tool"`
+	Version          string            `json:"version"`
+	Status           string            `json:"status"` // complete | partial
+	CaseID           string            `json:"case_id,omitempty"`
+	Mode             string            `json:"mode"`
+	ModeNote         string            `json:"mode_note"`
+	Host             string            `json:"host"` // where the collector ran
+	User             string            `json:"user"` // who ran it
+	OS               string            `json:"os"`
+	Root             string            `json:"image_root,omitempty"`
+	Home             string            `json:"home"`
+	SourceHost       string            `json:"source_host,omitempty"` // host the evidence belongs to, if known
+	ProfileUser      string            `json:"profile_user"`
+	Started          time.Time         `json:"collection_started"`
+	Finished         time.Time         `json:"collection_finished"`
+	WindowFrom       *time.Time        `json:"window_from,omitempty"`
+	WindowTo         *time.Time        `json:"window_to,omitempty"`
+	Redacted         bool              `json:"redacted"`
+	RedactionCount   int               `json:"redaction_count"`
+	RawIncluded      bool              `json:"raw_included"`
+	FullLiveLog      bool              `json:"full_live_log"`
+	Sources          int               `json:"sources_found"`
+	SourceErrors     int               `json:"source_errors"`
+	MalformedRecords int               `json:"malformed_records"`
+	Events           int               `json:"events_in_window"`
+	Sessions         int               `json:"sessions_in_window"`
+	Agents           map[string]int    `json:"events_per_agent"`
+	LiveLog          *LiveLogInfo      `json:"live_log,omitempty"`
+	Skipped          []string          `json:"skipped,omitempty"`
+	Captures         []string          `json:"captures"`
+	Entries          map[string]string `json:"entry_sha256"`
 }
 
 func (o CollectOptions) inWindow(t time.Time) bool {
@@ -263,28 +265,35 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 			s.Note = "file last modified before the window; not acquired"
 			continue
 		}
+		const unstable = "files kept changing during acquisition; the snapshot may be internally inconsistent"
 		switch {
 		case st.IsDir():
-			fe, notes, err := acquireDir(real, dst)
+			fe, notes, failed, err := acquireDir(real, dst, &scope)
 			s.Files, s.Diags = fe, append(s.Diags, notes...)
 			s.SHA256 = digestFiles(fe)
 			s.Note = fmt.Sprintf("directory: %d file(s) acquired; sha256 is a digest over per-file hashes", len(fe))
-			if err != nil {
+			switch {
+			case err != nil:
 				s.Error = err.Error()
+			case failed > 0:
+				s.Error = fmt.Sprintf("%d file(s) in the directory could not be acquired or kept changing (see diagnostics)", failed)
 			}
 			s.snapshot = dst
 		case isSQLiteParser(s.Parser):
-			fe, notes, err := acquireSet([]string{real, real + "-wal", real + "-shm"}, []string{"main", "wal", "shm"}, dst)
+			fe, notes, err := acquireSet([]string{real, real + "-wal", real + "-shm"}, []string{"main", "wal", "shm"}, dst, &scope)
 			s.Files, s.Diags = fe, append(s.Diags, notes...)
 			if err != nil {
 				s.Error = err.Error()
 				break
 			}
+			if anyChanged(fe) {
+				s.Error = unstable
+			}
 			s.SHA256 = fe[0].SHA256
 			s.snapshot = filepath.Join(dst, filepath.Base(real))
 			s.Note = "SQLite: database and sidecars copied sequentially (not an atomic snapshot); see per-file evidence"
 		default:
-			fe, notes, err := acquireSet([]string{real}, []string{"main"}, dst)
+			fe, notes, err := acquireSet([]string{real}, []string{"main"}, dst, &scope)
 			s.Diags = append(s.Diags, notes...)
 			if err != nil {
 				s.Error = err.Error()
@@ -293,6 +302,7 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 			s.SHA256 = fe[0].SHA256
 			if fe[0].Changed {
 				s.Files = fe
+				s.Error = unstable
 			}
 			s.snapshot = filepath.Join(dst, filepath.Base(real))
 		}
@@ -316,6 +326,7 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 			s.Note = strings.TrimSpace(s.Note + " " + res.Note)
 		}
 		s.Malformed = res.Malformed
+		m.MalformedRecords += res.Malformed
 		s.Diags = append(s.Diags, res.Diags...)
 		if perr != nil {
 			s.Error = perr.Error()
@@ -357,14 +368,21 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 	}
 
 	// live recorder log, if this device has one
-	// On the running system the log location comes from the resolved policy
-	// (it may be a central folder outside the profile). For an image, only
-	// the default per-user location inside the image is examined.
+	// The live log location is taken only from sources the operator or the
+	// administrator controls: --live-log, or the managed policy on the
+	// running system. The user's own policy and environment are ignored, so a
+	// collector running as SYSTEM cannot be pointed at an arbitrary file.
 	lp := filepath.Join(userStateDir(o.Roots), "events.jsonl")
 	liveScope := scope
-	if o.Root == "" {
-		lp = LiveLogPathFor(LoadPolicy(o.Roots), o.Roots)
+	switch {
+	case o.LiveLog != "":
+		lp = o.LiveLog
 		liveScope.Bases = append(append([]string{}, scope.Bases...), resolveDir(filepath.Dir(lp)))
+	case o.Root == "":
+		if mp := managedLogPath(o.Roots); mp != "" {
+			lp = mp
+			liveScope.Bases = append(append([]string{}, scope.Bases...), resolveDir(filepath.Dir(lp)))
+		}
 	}
 	if real, _, err := liveScope.Check(lp); err == nil {
 		collectLive(o, m, bw, real, filepath.Join(snap, "live"), cwds, lw)
@@ -400,7 +418,7 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 		bw.put("workspace_index.json", wb)
 	}
 	m.Status = "complete"
-	if m.SourceErrors > 0 {
+	if m.SourceErrors > 0 || m.MalformedRecords > 0 {
 		m.Status = "partial"
 	}
 	logf(lw, "%d step(s) across %d record stream(s) in window, %d redaction(s), %d source error(s)", m.Events, m.Sessions, m.RedactionCount, m.SourceErrors)
@@ -441,9 +459,18 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 		return bh, m, fmt.Errorf("bundle written but checksum sidecar could not be placed: %w", err)
 	}
 	if m.Status == "partial" {
-		return bh, m, fmt.Errorf("%w: %d source(s) had errors (listed in sources.json)", ErrPartial, m.SourceErrors)
+		return bh, m, fmt.Errorf("%w: %d source error(s), %d malformed record(s) (listed in sources.json)", ErrPartial, m.SourceErrors, m.MalformedRecords)
 	}
 	return bh, m, nil
+}
+
+// managedLogPath returns the log location set by a valid managed policy, or "".
+func managedLogPath(r Roots) string {
+	st := LoadPolicy(r)
+	if st.Origin == PolicyManaged && st.Err == nil && st.Policy.LogPath != "" {
+		return expandUser(st.Policy.LogPath, r)
+	}
+	return ""
 }
 
 func isSQLiteParser(p string) bool {
@@ -456,11 +483,15 @@ func isSQLiteParser(p string) bool {
 // re-chained. Live records are carried only in the live entry, not copied
 // into events.jsonl, so a reader never sees them twice.
 func collectLive(o CollectOptions, m *Manifest, bw *bundleWriter, lp, dst string, cwds map[string]bool, lw io.Writer) {
-	fe, notes, err := acquireSet([]string{lp}, []string{"main"}, dst)
+	fe, notes, err := acquireSet([]string{lp}, []string{"main"}, dst, nil)
 	if err != nil {
 		m.Skipped = append(m.Skipped, "live log: "+err.Error())
 		m.SourceErrors++
 		return
+	}
+	if anyChanged(fe) {
+		m.Skipped = append(m.Skipped, "live log: kept changing during acquisition; exported records come from an unstable copy")
+		m.SourceErrors++
 	}
 	snapPath := filepath.Join(dst, filepath.Base(lp))
 	f, err := os.Open(snapPath)
@@ -471,6 +502,10 @@ func collectLive(o CollectOptions, m *Manifest, bw *bundleWriter, lp, dst string
 	evs, rep := VerifyLiveLog(f)
 	f.Close()
 	info := &LiveLogInfo{Path: lp, SHA256: fe[0].SHA256, Records: rep.Records, Status: rep.Status, HeadHash: rep.HeadHash}
+	if !rep.OK() {
+		m.Skipped = append(m.Skipped, fmt.Sprintf("live log: %s (%s)", rep.Status, rep.Detail))
+		m.SourceErrors++
+	}
 	for _, n := range notes {
 		m.Skipped = append(m.Skipped, "live log: "+n)
 	}
@@ -583,9 +618,12 @@ func collectWorkspaces(o CollectOptions, m *Manifest, bw *bundleWriter, scope Sc
 					continue
 				}
 				n++
-				fe, _, err := acquireSet([]string{fpath}, []string{"main"}, filepath.Join(dst, fmt.Sprintf("%05d", n)))
+				fe, _, err := acquireSet([]string{fpath}, []string{"main"}, filepath.Join(dst, fmt.Sprintf("%05d", n)), &scope)
 				if err != nil {
 					m.Skipped = append(m.Skipped, err.Error())
+					if !errors.Is(err, ErrOutsideRoots) {
+						m.SourceErrors++
+					}
 					continue
 				}
 				b, err := os.ReadFile(filepath.Join(dst, fmt.Sprintf("%05d", n), filepath.Base(fpath)))
@@ -667,13 +705,18 @@ type BundleCheck struct {
 	Problems           []string     // structural or integrity problems; any problem makes the bundle invalid
 	Live               *ChainReport // recomputed from the live log bytes inside the bundle
 	LiveCollector      *ChainReport // what the collector reported about the original log (not re-verifiable for excerpts)
+	LiveMode           string       // excerpt | full, as declared by the manifest
+	BundleSHA256       string       // hash of the bundle file itself, for comparison with a value kept elsewhere
 	ParseIssues        int          // sources with errors, malformed records or generic fallback
 	Origin             string       // what the bundle can and cannot say about who produced it
 }
 
 // OK reports whether the bundle passed every structural and integrity check.
+// A live excerpt is accepted only when the manifest declares the live log
+// as an excerpt and the excerpt's records check out.
 func (b BundleCheck) OK() bool {
-	return b.ChecksumConsistent && len(b.Problems) == 0 && (b.Live == nil || b.Live.OK())
+	liveOK := b.Live == nil || b.Live.OK() || (b.LiveMode == "excerpt" && b.Live.Status == ChainExcerpt)
+	return b.ChecksumConsistent && len(b.Problems) == 0 && liveOK
 }
 
 const originNote = "A matching manifest and sidecar show the bundle is internally consistent and unchanged since it was hashed. They do not show who produced it or that it was collected the way the manifest says; anyone can create a consistent bundle. Keep the sidecar hash somewhere the collector's user cannot change (for example the ticket) to detect later modification."
@@ -706,6 +749,7 @@ func validEntryName(n string) error {
 // from a bundle reported as valid.
 func LoadBundle(p string, lim BundleLimits) ([]Event, *Manifest, []Source, BundleCheck, error) {
 	chk := BundleCheck{Origin: originNote}
+	chk.BundleSHA256, _ = hashFile(p)
 	zr, err := zip.OpenReader(p)
 	if err != nil {
 		return nil, nil, nil, chk, err
@@ -822,8 +866,7 @@ func LoadBundle(p string, lim BundleLimits) ([]Event, *Manifest, []Source, Bundl
 		}
 	}
 	if b, err := os.ReadFile(p + ".sha256"); err == nil {
-		h, _ := hashFile(p)
-		if f := strings.Fields(string(b)); len(f) == 0 || f[0] != h {
+		if f := strings.Fields(string(b)); len(f) == 0 || f[0] != chk.BundleSHA256 {
 			bad("bundle hash does not match %s", path.Base(filepath.ToSlash(p))+".sha256")
 			hashOK = false
 		}
@@ -870,6 +913,10 @@ func LoadBundle(p string, lim BundleLimits) ([]Event, *Manifest, []Source, Bundl
 
 	if li := m.LiveLog; li != nil {
 		chk.LiveCollector = &ChainReport{Status: li.Status, Records: li.Records, HeadHash: li.HeadHash}
+		chk.LiveMode = li.Mode
+		if li.Status != ChainConsistent && li.Status != ChainEmpty {
+			bad("the original live log was %s at collection (collector-reported); the exported records cannot be relied on as a complete record", li.Status)
+		}
 		b, ok := files[li.Entry]
 		if !ok {
 			bad("manifest lists live log entry %q but it is missing", li.Entry)

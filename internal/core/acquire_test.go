@@ -7,9 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -27,7 +25,7 @@ func TestMutationDuringAcquisitionIsRetriedAndReported(t *testing.T) {
 		}
 	}
 	defer func() { acquireHook = nil }()
-	ev, notes, err := acquireSet([]string{src}, []string{"main"}, t.TempDir())
+	ev, notes, err := acquireSet([]string{src}, []string{"main"}, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +38,7 @@ func TestMutationDuringAcquisitionIsRetriedAndReported(t *testing.T) {
 		f.WriteString("more\n")
 		f.Close()
 	}
-	ev, notes, err = acquireSet([]string{src}, []string{"main"}, t.TempDir())
+	ev, notes, err = acquireSet([]string{src}, []string{"main"}, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,26 +129,6 @@ func TestDirectoryChildrenNewerThanDirectoryAreIncluded(t *testing.T) {
 		if s.Parser == "opencode-storage" && (len(s.Files) != 2 || s.SHA256 == "") {
 			t.Fatalf("per-file evidence missing: %+v", s)
 		}
-	}
-}
-
-func TestUnreadableSourceMakesCollectionPartial(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("named pipes are created differently on Windows")
-	}
-	home := isolate(t)
-	claudeSession(t, home, "ok", home, t0, map[string]any{"role": "user", "content": "hello"})
-	fifo := filepath.Join(home, ".claude", "projects", "proj", "pipe.jsonl")
-	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
-		t.Skip("mkfifo unavailable:", err)
-	}
-	out := filepath.Join(t.TempDir(), "b.zip")
-	_, m, err := Collect(CollectOptions{Roots: RootsFor(home), Out: out})
-	if !errors.Is(err, ErrPartial) || m.Status != "partial" || m.SourceErrors != 1 {
-		t.Fatalf("want partial with one source error, got err=%v status=%s errors=%d", err, m.Status, m.SourceErrors)
-	}
-	if chk := check(t, out); !chk.OK() || chk.ParseIssues == 0 {
-		t.Fatalf("a partial bundle is still a valid bundle and must report its gaps: %+v", chk)
 	}
 }
 

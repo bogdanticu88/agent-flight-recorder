@@ -590,6 +590,15 @@ func denyResult(agent, eventName, reason string) HookResult {
 
 // ------------------------------------------------------------------ chained log
 
+// Windows access rights (icacls names) the recorder needs on its own log file:
+// reading the last record to extend the chain, and appending. The deployment
+// ACL in deploy/windows/Install-AFR.ps1 must grant exactly these and nothing
+// that allows overwriting, deleting or re-permissioning the file.
+var (
+	LogReadRights   = []string{"RD", "RA", "REA", "RC", "S"}
+	LogAppendRights = []string{"AD", "S"}
+)
+
 // lockDir is a directory the hook's user can always write to and delete from.
 // The lock is kept out of the (possibly append-only) log directory.
 func lockDir(r Roots) string { return filepath.Join(userStateDir(r), "locks") }
@@ -617,13 +626,13 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 		return err
 	}
 	e.PrevHash = prev
-	e.Pos, e.Prov, e.Outcome = 0, "", ""
+	e.Pos, e.Prov, e.Outcome, e.OutcomeNote = 0, "", "", ""
 	e.Hash = e.ComputeHash()
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := openAppend(path)
 	if err != nil {
 		return err
 	}
@@ -712,9 +721,12 @@ type ChainReport struct {
 	Checkpoint string         `json:"checkpoint,omitempty"`
 }
 
-// OK reports whether the status is one verify accepts.
+// OK reports whether the input is a complete, internally consistent log (or
+// an empty one). An excerpt is never OK on its own: its records can match
+// their hashes while records inside its window are missing. Bundles accept an
+// excerpt only when their manifest declares one (see BundleCheck).
 func (c ChainReport) OK() bool {
-	return c.Status == ChainConsistent || c.Status == ChainExcerpt || c.Status == ChainEmpty
+	return c.Status == ChainConsistent || c.Status == ChainEmpty
 }
 
 // ExcerptHeader is the first line of a windowed export of a live log. Records
@@ -749,7 +761,10 @@ func ParseCheckpoint(s string) (Checkpoint, error) {
 	if _, err := fmt.Sscanf(n, "%d", &cp.Records); err != nil || cp.Records < 1 {
 		return cp, fmt.Errorf("checkpoint record count %q invalid", n)
 	}
-	cp.Hash = h
+	if len(h) != 64 || strings.Trim(strings.ToLower(h), "0123456789abcdef") != "" {
+		return cp, fmt.Errorf("checkpoint hash must be 64 hex characters")
+	}
+	cp.Hash = strings.ToLower(h)
 	return cp, nil
 }
 
@@ -779,14 +794,15 @@ func VerifyLiveLog(r io.Reader) ([]Event, ChainReport) {
 	var evs []Event
 	var hdr *ExcerptHeader
 	prev := ""
-	line, malformed, contiguousBreaks := 0, 0, 0
+	line, malformed, contiguousBreaks, nonEmpty := 0, 0, 0, 0
 	for sc.Scan() {
 		line++
 		b := bytes.TrimSpace(sc.Bytes())
 		if len(b) == 0 {
 			continue
 		}
-		if len(evs) == 0 && hdr == nil && bytes.Contains(b, []byte(`"afr_excerpt"`)) {
+		nonEmpty++
+		if nonEmpty == 1 && bytes.Contains(b, []byte(`"afr_excerpt"`)) {
 			var w struct {
 				H *ExcerptHeader `json:"afr_excerpt"`
 			}
@@ -804,6 +820,9 @@ func VerifyLiveLog(r io.Reader) ([]Event, ChainReport) {
 		}
 		if e.ComputeHash() != e.Hash {
 			rep.Breaks = append(rep.Breaks, fmt.Sprintf("line %d: content does not match its hash (record edited)", line))
+		}
+		if hdr != nil && ((hdr.WindowFrom != nil && e.TS.Before(*hdr.WindowFrom)) || (hdr.WindowTo != nil && e.TS.After(*hdr.WindowTo))) {
+			rep.Breaks = append(rep.Breaks, fmt.Sprintf("line %d: record is outside the window the excerpt header declares", line))
 		}
 		switch {
 		case len(evs) == 0:
@@ -846,7 +865,7 @@ func VerifyLiveLog(r io.Reader) ([]Event, ChainReport) {
 		rep.Detail = "no records"
 	case hdr != nil:
 		rep.Status = ChainExcerpt
-		rep.Detail = fmt.Sprintf("excerpt of %d record(s) from %s: every record matches its hash; %d gap(s) where records outside the window were left out; the first record's predecessor is external. Original log at collection: %s, %d record(s).",
+		rep.Detail = fmt.Sprintf("excerpt of %d record(s) said to come from %s. Each included record matches its own hash; %d gap(s) where records were omitted, and whether the omitted records really fell outside the window cannot be checked from the excerpt; the first record's predecessor is external. This is not a complete log and does not show that nothing in the window was left out. Header claims about the original (%s, %d record(s)) are as recorded by whoever wrote the excerpt.",
 			len(evs), hdr.SourcePath, contiguousBreaks, hdr.SourceStatus, hdr.SourceRecords)
 	case evs[0].PrevHash != "":
 		rep.Status = ChainUnanchored
@@ -859,15 +878,19 @@ func VerifyLiveLog(r io.Reader) ([]Event, ChainReport) {
 }
 
 // ApplyCheckpoint checks a log against an independently retained checkpoint.
+// It is only evaluated on a log that is consistent from its genesis record;
+// on anything else the record numbering cannot be trusted.
 func ApplyCheckpoint(evs []Event, rep *ChainReport, cp Checkpoint) {
 	switch {
 	case rep.Excerpt != nil:
-		rep.Checkpoint = "not applicable to an excerpt"
+		rep.Checkpoint = "not evaluated: an excerpt cannot be checked against a checkpoint"
+	case rep.Status != ChainConsistent:
+		rep.Checkpoint = "not evaluated: the log is " + rep.Status
 	case len(evs) < cp.Records:
 		rep.Checkpoint = fmt.Sprintf("FAILED: log has %d record(s), checkpoint expects at least %d (records removed from the end)", len(evs), cp.Records)
 		rep.Status = ChainBroken
 	case evs[cp.Records-1].Hash != cp.Hash:
-		rep.Checkpoint = fmt.Sprintf("FAILED: record %d does not match the checkpoint hash (log rewritten)", cp.Records)
+		rep.Checkpoint = fmt.Sprintf("FAILED: record %d does not match the checkpoint hash (log rewritten, or not the log the checkpoint was taken from)", cp.Records)
 		rep.Status = ChainBroken
 	default:
 		rep.Checkpoint = fmt.Sprintf("matches the checkpoint at record %d", cp.Records)

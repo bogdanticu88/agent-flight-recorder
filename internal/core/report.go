@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Relation describes how a tool call refers to a trace target.
@@ -26,29 +27,59 @@ const (
 	CatOther  = "other"
 )
 
-// ToolCategory classifies a tool by name. It is a heuristic over vendor
-// naming, used only to decide whether a call can count as file access.
+// toolTokens splits a tool name into lower-case words at underscores,
+// hyphens, spaces, punctuation and camelCase boundaries:
+// "copilot_readFile" -> [copilot read file].
+func toolTokens(tool string) []string {
+	var out []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			out = append(out, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	rs := []rune(tool)
+	for i, r := range rs {
+		switch {
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			flush()
+		case unicode.IsUpper(r) && i > 0 && (unicode.IsLower(rs[i-1]) || (i+1 < len(rs) && unicode.IsLower(rs[i+1]) && unicode.IsUpper(rs[i-1]))):
+			flush()
+			cur = append(cur, r)
+		default:
+			cur = append(cur, r)
+		}
+	}
+	flush()
+	return out
+}
+
+var toolWords = []struct {
+	cat   string
+	words []string
+}{
+	{CatSearch, []string{"grep", "search", "glob", "find", "codebase", "ripgrep", "rg"}},
+	{CatList, []string{"list", "ls", "readdir", "dir", "tree"}},
+	{CatShell, []string{"bash", "shell", "terminal", "command", "exec", "execute", "powershell", "sh"}},
+	{CatWrite, []string{"write", "edit", "replace", "create", "patch", "apply", "insert", "multiedit", "notebookedit"}},
+	{CatRead, []string{"read", "view", "open", "readfile", "cat"}},
+}
+
+// ToolCategory classifies a tool by the whole words in its name, not by
+// substrings ("certificate" is not "cat", "opencode" is not "open"). It is a
+// heuristic over vendor naming, used only to decide whether a call can count
+// as file access; anything unrecognised is CatOther and never counts.
 func ToolCategory(tool string) string {
-	t := strings.ToLower(tool)
-	has := func(subs ...string) bool {
-		for _, s := range subs {
-			if strings.Contains(t, s) {
-				return true
+	toks := toolTokens(tool)
+	for _, tw := range toolWords {
+		for _, t := range toks {
+			for _, w := range tw.words {
+				if t == w {
+					return tw.cat
+				}
 			}
 		}
-		return false
-	}
-	switch {
-	case has("grep", "search", "glob", "find", "codebase", "ripgrep") || t == "rg":
-		return CatSearch
-	case has("list", "ls_", "readdir", "read_dir") || t == "ls":
-		return CatList
-	case has("bash", "shell", "terminal", "command", "exec", "powershell"):
-		return CatShell
-	case has("write", "edit", "replace", "create_file", "patch", "apply", "insert", "notebook"):
-		return CatWrite
-	case has("read", "view", "open", "cat", "fetch_file", "get_file"):
-		return CatRead
 	}
 	return CatOther
 }
@@ -69,6 +100,7 @@ type Finding struct {
 	Prompt          *Event // most recent human prompt recorded before FirstRequest (scoped sessions only)
 	Lead            []Event
 	Hits            int
+	Related         []string
 	Summary         []string
 }
 
@@ -81,6 +113,7 @@ type SessionView struct {
 	Steps                        []Event
 	Hits                         map[int]bool // index in Steps -> matches a trace target
 	Alerts, Tools                int
+	Related                      []string // other streams with the same host, user, agent and session ID
 }
 
 // BundleInfo is one input bundle with its own manifest and integrity result.
@@ -173,18 +206,23 @@ func relationOf(e Event, target string) string {
 	return RelMention
 }
 
-// correlate sets Outcome on every tool call in a session view from its policy
-// decision and the result(s) recorded with the same call ID.
-func correlate(steps []Event) {
+// correlate sets Outcome on every tool call in one record stream from its
+// policy decision and the results recorded after it with the same call ID.
+// Anything ambiguous stays unknown: a call ID shared by several calls,
+// results with conflicting statuses, or a stream without a session ID (its
+// results cannot be attributed to a particular session).
+func correlate(steps []Event, unscoped bool) {
+	calls := map[string]int{}
 	results := map[string][]int{}
 	unmatched := 0
 	for i, e := range steps {
-		if e.Kind == KindToolResult {
-			if e.CallID != "" {
-				results[e.CallID] = append(results[e.CallID], i)
-			} else {
-				unmatched++
-			}
+		switch {
+		case e.Kind == KindToolCall && e.CallID != "":
+			calls[e.CallID]++
+		case e.Kind == KindToolResult && e.CallID != "":
+			results[e.CallID] = append(results[e.CallID], i)
+		case e.Kind == KindToolResult:
+			unmatched++
 		}
 	}
 	for i := range steps {
@@ -192,32 +230,56 @@ func correlate(steps []Event) {
 		if e.Kind != KindToolCall {
 			continue
 		}
-		switch {
-		case e.Decision == "deny":
+		e.Outcome, e.OutcomeNote = "", ""
+		if e.Decision == "deny" {
 			e.Outcome = OutcomeBlocked
-		case e.CallID == "":
+			continue
+		}
+		if e.CallID == "" {
 			if unmatched > 0 {
-				e.Outcome = OutcomeUnknown
+				e.Outcome, e.OutcomeNote = OutcomeUnknown, "the call has no ID, so recorded results cannot be matched to it"
 			} else {
 				e.Outcome = OutcomeRequested
 			}
+			continue
+		}
+		var after []int
+		for _, j := range results[e.CallID] {
+			if steps[j].Pos > e.Pos {
+				after = append(after, j)
+			}
+		}
+		switch {
+		case len(after) == 0:
+			e.Outcome = OutcomeRequested
+			continue
+		case unscoped:
+			e.Outcome, e.OutcomeNote = OutcomeUnknown, "this stream has no session ID, so a result with the same call ID cannot be attributed to this call"
+			continue
+		case calls[e.CallID] > 1:
+			e.Outcome, e.OutcomeNote = OutcomeUnknown, fmt.Sprintf("%d calls in this stream share the call ID %q, so results cannot be matched to one of them", calls[e.CallID], e.CallID)
+			continue
+		}
+		seen := map[string]bool{}
+		for _, j := range after {
+			switch steps[j].Status {
+			case StatusSuccess:
+				seen[OutcomeCompleted] = true
+			case StatusError, StatusCancelled:
+				seen[OutcomeFailed] = true
+			case StatusRejected:
+				seen[OutcomeBlocked] = true
+			}
+		}
+		switch len(seen) {
+		case 0:
+			e.Outcome, e.OutcomeNote = OutcomeUnknown, "a result is recorded but without a success or error status"
+		case 1:
+			for o := range seen {
+				e.Outcome = o
+			}
 		default:
-			idx := results[e.CallID]
-			if len(idx) == 0 {
-				e.Outcome = OutcomeRequested
-				continue
-			}
-			e.Outcome = OutcomeUnknown
-			for _, j := range idx { // a later definitive status wins over an earlier unknown one
-				switch steps[j].Status {
-				case StatusSuccess:
-					e.Outcome = OutcomeCompleted
-				case StatusError, StatusCancelled:
-					e.Outcome = OutcomeFailed
-				case StatusRejected:
-					e.Outcome = OutcomeBlocked
-				}
-			}
+			e.Outcome, e.OutcomeNote = OutcomeUnknown, "results recorded for this call report conflicting statuses"
 		}
 	}
 }
@@ -252,12 +314,44 @@ func BuildReport(evs []Event, targets []string) ([]SessionView, []Finding, []Eve
 		}
 		sv.Steps = append(sv.Steps, e)
 	}
+	// Streams that share host, user, agent and session ID are parts of one
+	// session recorded in different places (a subagent transcript, a second
+	// store, a repeated collection). They are linked, not merged: their
+	// relative order is not known.
+	ident := map[string][]string{}
+	identOf := func(sv *SessionView) string {
+		return strings.Join([]string{sv.Host, sv.User, sv.Agent, sv.SessionID}, "\x1f")
+	}
+	label := func(sv *SessionView) string {
+		l := sv.Prov
+		if sv.Source != "" {
+			l += " · " + sv.Source
+		}
+		if l == "" {
+			l = sv.Origin
+		}
+		return l
+	}
+	for _, k := range order {
+		if sv := groups[k]; !sv.Unscoped {
+			ident[identOf(sv)] = append(ident[identOf(sv)], k)
+		}
+	}
+	for _, keys := range ident {
+		for _, k := range keys {
+			for _, o := range keys {
+				if o != k {
+					groups[k].Related = append(groups[k].Related, label(groups[o]))
+				}
+			}
+		}
+	}
 	var sessions []SessionView
 	var findings []Finding
 	for _, k := range order {
 		sv := groups[k]
 		sort.SliceStable(sv.Steps, func(i, j int) bool { return sv.Steps[i].Pos < sv.Steps[j].Pos })
-		correlate(sv.Steps)
+		correlate(sv.Steps, sv.Unscoped)
 		for _, e := range sv.Steps {
 			if e.Kind == KindToolCall {
 				sv.Tools++
@@ -289,7 +383,7 @@ func BuildReport(evs []Event, targets []string) ([]SessionView, []Finding, []Eve
 
 func traceSession(sv *SessionView, t string) (Finding, bool) {
 	f := Finding{Target: t, Agent: sv.Agent, SessionID: sv.SessionID, Host: sv.Host, User: sv.User,
-		Prov: sv.Prov, Source: sv.Source, Unscoped: sv.Unscoped}
+		Prov: sv.Prov, Source: sv.Source, Unscoped: sv.Unscoped, Related: sv.Related}
 	for i := range sv.Steps {
 		e := sv.Steps[i]
 		if !eventMatches(e, t) {
@@ -358,6 +452,9 @@ func relationPhrase(rel string) string {
 }
 
 func outcomeBasis(e *Event, steps []Event) string {
+	if e.OutcomeNote != "" {
+		return e.OutcomeNote
+	}
 	switch e.Outcome {
 	case OutcomeBlocked:
 		if e.Decision == "deny" {
@@ -415,6 +512,9 @@ func summarise(f Finding, steps []Event) []string {
 	}
 	if f.Unscoped {
 		out = append(out, "These events carry no session ID; they are listed together because they share a source, not because they are known to belong to one session.")
+	}
+	if n := len(f.Related); n > 0 {
+		out = append(out, fmt.Sprintf("The same session ID on the same host, user and agent also appears in %d other record stream(s) (listed under the stream); those records are reported separately and are not ordered relative to these.", n))
 	}
 	return out
 }

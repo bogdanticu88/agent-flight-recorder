@@ -24,12 +24,17 @@
       - SYSTEM and Administrators: full control.
       - Users, on the folder only: create files, list, read attributes.
         No delete-child, so users cannot delete or rename other files.
-      - Files a user creates: owner may read and append data. No write-data
-        (no overwrite or truncate), no delete. "OWNER RIGHTS" caps the
-        owner's implicit right to change the file's permissions.
+      - Files a user creates: owner may read and append data (RD,AD,RA,REA,
+        RC,S). No write-data (no overwrite or truncate), no write-attributes,
+        no delete. "OWNER RIGHTS" caps the owner's implicit right to change
+        the file's permissions. afr opens the log with append+synchronize
+        only (see internal/core/logfile_windows.go), because a normal
+        append-mode open also asks for write-attributes and would be refused.
     Known gaps: a user can create a file under another user's name before
-    that user does (the victim's hook then cannot append and reports the
-    failure); local administrators can do anything; a user can still remove
+    that user does; the victim's hook then cannot append (it reports the
+    failure), and the squatter can append records that claim to be the
+    victim's. Attribute records by the file owner's SID, not by the "user"
+    field inside them. Local administrators can do anything; a user can still remove
     or edit the hook configuration in their own profile for user-scope
     agents. Ship the log to Sentinel and treat that copy as authoritative.
 
@@ -71,9 +76,9 @@ Invoke-Checked "icacls $data" { icacls $data /inheritance:r /grant:r "SYSTEM:(OI
 Invoke-Checked "icacls $logs" {
     icacls $logs /inheritance:r /grant:r `
         "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" `
-        "Users:(RD,WD,X,RA,REA,RC)" `
-        "CREATOR OWNER:(OI)(IO)(RD,AD,RA,REA,RC)" `
-        "OWNER RIGHTS:(OI)(IO)(RD,AD,RA,REA,RC)"
+        "Users:(RD,WD,X,RA,REA,RC,S)" `
+        "CREATOR OWNER:(OI)(IO)(RD,AD,RA,REA,RC,S)" `
+        "OWNER RIGHTS:(OI)(IO)(RD,AD,RA,REA,RC,S)"
 }
 
 # Machine policy. log_path sends every user's events to the central folder.

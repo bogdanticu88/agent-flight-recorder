@@ -87,16 +87,17 @@ type Event struct {
 	PrevHash string `json:"prev_hash,omitempty"`
 	Hash     string `json:"hash,omitempty"`
 
-	Pos     int    `json:"pos,omitempty"`     // not hashed: position within its input (line or emission order)
-	Prov    string `json:"prov,omitempty"`    // not hashed: input the event was read from (bundle entry, log path)
-	Outcome string `json:"outcome,omitempty"` // not hashed: derived at report time
+	Pos         int    `json:"pos,omitempty"`          // not hashed: position within its input (line or emission order)
+	Prov        string `json:"prov,omitempty"`         // not hashed: input the event was read from (bundle entry, log path)
+	Outcome     string `json:"outcome,omitempty"`      // not hashed: derived at report time
+	OutcomeNote string `json:"outcome_note,omitempty"` // not hashed: why the outcome is what it is
 }
 
 // ComputeHash returns the chain hash for a live event. Provenance and derived
 // fields are excluded so that display metadata never changes signed content.
 func (e Event) ComputeHash() string {
 	c := e
-	c.Hash, c.Pos, c.Prov, c.Outcome = "", 0, "", ""
+	c.Hash, c.Pos, c.Prov, c.Outcome, c.OutcomeNote = "", 0, "", "", ""
 	b, _ := json.Marshal(c)
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])

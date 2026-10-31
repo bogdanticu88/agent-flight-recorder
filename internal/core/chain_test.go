@@ -143,8 +143,8 @@ func TestExcerptVerification(t *testing.T) {
 	q := filepath.Join(t.TempDir(), "ex.jsonl")
 	rewrite(t, q, []string{hdr, lines[1], lines[3]})
 	_, rep := ReadLiveLog(q)
-	if rep.Status != ChainExcerpt || !rep.OK() {
-		t.Fatalf("excerpt: %+v", rep)
+	if rep.Status != ChainExcerpt || rep.OK() {
+		t.Fatalf("an excerpt must be recognised as one and never pass as a complete log: %+v", rep)
 	}
 	mustContain(t, rep.Detail, "predecessor is external")
 
@@ -168,7 +168,7 @@ func TestAppendRefusesUnparseableTail(t *testing.T) {
 }
 
 func TestCheckpointParsing(t *testing.T) {
-	if _, err := ParseCheckpoint("3:abc"); err != nil {
+	if _, err := ParseCheckpoint("3:" + strings.Repeat("ab", 32)); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []string{"", "abc", "0:abc", "x:abc", "3:"} {
