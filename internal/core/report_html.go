@@ -14,16 +14,10 @@ var funcs = template.FuncMap{
 		}
 		return t.UTC().Format("2006-01-02 15:04:05Z")
 	},
-	"kl": kindLabel,
-	"short": func(s string, n int) string {
-		s = strings.TrimSpace(s)
-		if len(s) > n {
-			return s[:n] + "..."
-		}
-		return s
-	},
-	"inc":  func(i int) int { return i + 1 },
-	"join": strings.Join,
+	"kl":    kindLabel,
+	"short": func(s string, n int) string { return Truncate(strings.TrimSpace(s), n) },
+	"inc":   func(i int) int { return i + 1 },
+	"join":  strings.Join,
 	"dur": func(a, b time.Time) string {
 		if a.IsZero() || b.IsZero() {
 			return ""
@@ -64,64 +58,71 @@ tr.hit{background:#fff4d6}tr.alert{background:#fde8ea}.finding{border-left:4px s
 .step .h{font-size:12px;color:var(--mut)}details summary{cursor:pointer;font-weight:600;padding:4px 0}.mut{color:var(--mut)}.small{font-size:12px}
 .chain{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0}.chain .arrow{color:var(--mut)}
 </style></head><body>
-<header><h1>{{.Title}}</h1><div class="sub">Agent Flight Recorder {{if .Manifest}}v{{.Manifest.Version}} · case {{if .Manifest.CaseID}}{{.Manifest.CaseID}}{{else}}(none){{end}} · {{.Manifest.Host}} / {{.Manifest.User}}{{end}} · generated {{ts .Generated}}</div></header>
+<header><h1>{{.Title}}</h1><div class="sub">Agent Flight Recorder · {{len .Bundles}} bundle(s), {{len .LiveChains}} live log(s) · generated {{ts .Generated}}</div></header>
 <main>
 
 <div class="grid">
- <div class="card kpi"><div class="n">{{len .Sessions}}</div><div class="l">Sessions</div></div>
+ <div class="card kpi"><div class="n">{{len .Sessions}}</div><div class="l">Record streams</div></div>
  <div class="card kpi"><div class="n">{{.TotalSteps}}</div><div class="l">Steps</div></div>
  <div class="card kpi"><div class="n">{{len .Findings}}</div><div class="l">Trace findings</div></div>
  <div class="card kpi"><div class="n">{{len .Alerts}}</div><div class="l">Policy alerts / denies</div></div>
- <div class="card kpi"><div class="n">{{if .Verified}}<span class="ok">Verified</span>{{else if .Integrity}}<span class="bad">Problems</span>{{else}}<span class="mut">n/a</span>{{end}}</div><div class="l">Evidence integrity</div></div>
 </div>
 
-{{if .Manifest}}<h2>Evidence</h2><div class="card"><table class="meta">
-<tr><td>Collection mode</td><td><b>{{.Manifest.Mode}}</b>. {{.Manifest.ModeNote}}</td></tr>
-<tr><td>Host / user / OS</td><td>{{.Manifest.Host}} / {{.Manifest.User}} / {{.Manifest.OS}}</td></tr>
-<tr><td>Profile examined</td><td><code>{{.Manifest.Home}}</code></td></tr>
-<tr><td>Collected</td><td>{{ts .Manifest.Started}} → {{ts .Manifest.Finished}}</td></tr>
-<tr><td>Time window</td><td>{{if .Manifest.WindowFrom}}{{ts (deref .Manifest.WindowFrom)}}{{else}}open{{end}} → {{if .Manifest.WindowTo}}{{ts (deref .Manifest.WindowTo)}}{{else}}open{{end}}</td></tr>
-<tr><td>Redaction</td><td>{{if .Manifest.Redacted}}on, {{.Manifest.RedactionCount}} secret(s) removed on the device{{else}}<span class="bad">off</span>{{end}}{{if .Manifest.RawIncluded}} · raw source files included (unredacted){{end}}</td></tr>
-<tr><td>Integrity</td><td>{{if .Verified}}<span class="ok">All {{len .Manifest.Entries}} bundle entries match their recorded SHA-256.</span>{{else}}{{range .Integrity}}<div class="bad">{{.}}</div>{{end}}{{end}}</td></tr>
-{{range $k, $v := .LiveChains}}<tr><td>Live log chain</td><td><code>{{$k}}</code>: {{$v.Records}} record(s), {{if eq $v.Status "intact"}}<span class="ok">hash chain intact</span>{{else}}<span class="bad">{{$v.Status}}</span>{{range $v.Breaks}}<div class="small bad">{{.}}</div>{{end}}{{end}}</td></tr>{{end}}
-</table></div>{{else}}{{range $k, $v := .LiveChains}}<h2>Live log</h2><div class="card"><code>{{$k}}</code>: {{$v.Records}} record(s), {{if eq $v.Status "intact"}}<span class="ok">hash chain intact</span>{{else}}<span class="bad">{{$v.Status}}</span>{{range $v.Breaks}}<div class="small bad">{{.}}</div>{{end}}{{end}}</div>{{end}}{{end}}
+{{range .Bundles}}<h2>Bundle: <code>{{.Path}}</code></h2><div class="card"><table class="meta">
+<tr><td>Checksum consistency</td><td>{{if .Check.ChecksumConsistent}}<span class="ok">Every entry matches the SHA-256 recorded in the manifest.</span>{{else}}<span class="bad">Not consistent.</span>{{end}}{{range .Check.Problems}}<div class="bad small">{{.}}</div>{{end}}</td></tr>
+<tr><td>Parsing completeness</td><td>{{if .Check.ParseIssues}}<span class="bad">{{.Check.ParseIssues}} source(s) with errors, malformed records or generic fallback</span> (see Artifacts examined){{else}}No parse errors recorded by the collector.{{end}}{{if .Manifest}}{{if eq .Manifest.Status "partial"}} <span class="bad">Collection was partial.</span>{{end}}{{end}}</td></tr>
+<tr><td>Live log in bundle</td><td>{{with .Check.Live}}{{.Status}}: {{.Detail}}{{else}}none{{end}}{{with .Check.LiveCollector}}<div class="small mut">Collector-reported status of the original log at collection time (not re-verifiable from this bundle unless the full log is included): {{.Status}}, {{.Records}} record(s), head {{short .HeadHash 16}}</div>{{end}}</td></tr>
+<tr><td>Origin</td><td class="small">{{.Check.Origin}}</td></tr>
+{{with .Manifest}}<tr><td>Collection mode</td><td><b>{{.Mode}}</b>. {{.ModeNote}}</td></tr>
+<tr><td>Case / host / user</td><td>{{if .CaseID}}{{.CaseID}}{{else}}(none){{end}} / {{if .SourceHost}}{{.SourceHost}}{{else}}(unknown){{end}} / {{.ProfileUser}} <span class="small mut">(collected on {{.Host}} as {{.User}}, {{.OS}})</span></td></tr>
+<tr><td>Profile examined</td><td><code>{{.Home}}</code>{{if .Root}} under image root <code>{{.Root}}</code>{{end}}</td></tr>
+<tr><td>Collected</td><td>{{ts .Started}} → {{ts .Finished}}</td></tr>
+<tr><td>Time window</td><td>{{if .WindowFrom}}{{ts (deref .WindowFrom)}}{{else}}open{{end}} → {{if .WindowTo}}{{ts (deref .WindowTo)}}{{else}}open{{end}}</td></tr>
+<tr><td>Redaction</td><td>{{if .Redacted}}on, {{.RedactionCount}} replacement(s) made on the device{{else}}<span class="bad">off</span>{{end}}{{if .RawIncluded}} · <span class="bad">raw source files included (unredacted)</span>{{end}}{{if .FullLiveLog}} · <span class="bad">full live log included</span>{{end}}</td></tr>
+{{if .Skipped}}<tr><td>Skipped references</td><td class="small">{{range .Skipped}}<div>{{.}}</div>{{end}}</td></tr>{{end}}{{end}}
+</table></div>{{end}}
+
+{{range $k, $v := .LiveChains}}<h2>Live log: <code>{{$k}}</code></h2><div class="card"><b>{{$v.Status}}</b>: {{$v.Detail}}{{range $v.Breaks}}<div class="small bad">{{.}}</div>{{end}}
+<div class="small mut">An unkeyed hash chain shows internal consistency only. Anyone able to rewrite the file can rebuild a consistent chain, and deletion of the newest records is only detectable against an independently retained checkpoint.</div></div>{{end}}
 
 {{if .Targets}}<h2>Trace: {{join .Targets ", "}}</h2>
-{{if not .Findings}}<div class="card">No step in any session references the target(s). If EDR shows the access, the agent may have used a tool that did not log arguments, the session may have been deleted, or the access came from something other than an agent (indexer, extension, the user).</div>{{end}}
+{{if not .Findings}}<div class="card">No step in any record stream references the target(s). If endpoint telemetry shows an access, possible explanations include a tool that does not record arguments, a deleted or uncollected session, or access by something other than an agent (an indexer, an extension, the user).</div>{{end}}
 {{range .Findings}}<div class="card finding">
-<h3>{{.Target}} <span class="mut small">· {{.Agent}} · session {{.SessionID}} · {{.AllHits}} matching step(s)</span></h3>
-<div class="verdict">{{.Verdict}}</div>
+<h3>{{.Target}} <span class="mut small">· {{.Agent}} · session {{if .SessionID}}{{.SessionID}}{{else}}(none){{end}}{{if .Host}} · host {{.Host}}{{end}}{{if .User}} · user {{.User}}{{end}} · {{.Hits}} matching step(s)</span></h3>
+<div class="small mut">{{.Prov}}{{if .Source}} · {{.Source}}{{end}}</div>
+<div class="verdict">{{range .Summary}}<p>{{.}}</p>{{end}}</div>
 <div class="chain">
-{{if and .Introduced .Prompt}}{{if gt .Introduced.Seq .Prompt.Seq}}<span class="badge k-prompt">human prompt #{{.Prompt.Seq}}</span><span class="arrow">→</span>{{end}}{{end}}
-{{if .Introduced}}<span class="badge k-{{.Introduced.Kind}}">first seen: {{kl .Introduced.Kind}} #{{.Introduced.Seq}}</span>{{end}}
-{{if and .Introduced .Prompt}}{{if lt .Introduced.Seq .Prompt.Seq}}<span class="arrow">→</span><span class="badge k-prompt">human prompt #{{.Prompt.Seq}}</span>{{end}}{{end}}
-{{if .FirstAccess}}<span class="arrow">→</span><span class="badge k-tool_call">first access: {{.FirstAccess.Tool}} #{{.FirstAccess.Seq}}</span>{{end}}
+{{with .FirstMention}}<span class="badge k-{{.Kind}}">first mention: {{kl .Kind}} #{{.Pos}}</span>{{end}}
+{{with .FirstRequest}}<span class="arrow">→</span><span class="badge k-tool_call">first request: {{.Tool}} #{{.Pos}} ({{.Outcome}})</span>{{end}}
+{{with .FirstCompletion}}<span class="arrow">→</span><span class="badge k-tool_result">supported completion: {{.Tool}} #{{.Pos}}</span>{{end}}
 </div>
-{{if .Prompt}}<div class="step"><div class="h">Human instruction in force · {{ts .Prompt.TS}}</div><pre>{{short .Prompt.Text 3000}}</pre></div>{{end}}
-{{if .Introduced}}<div class="step"><div class="h">Where it first appeared · step {{.Introduced.Seq}} · {{kl .Introduced.Kind}} {{.Introduced.Tool}} · {{ts .Introduced.TS}}</div><pre>{{if .Introduced.Input}}{{short .Introduced.Input 1500}}
-{{end}}{{short .Introduced.Text 2500}}</pre></div>{{end}}
-{{if .FirstAccess}}<div class="step"><div class="h">First access · step {{.FirstAccess.Seq}} · tool <b>{{.FirstAccess.Tool}}</b> · {{ts .FirstAccess.TS}}{{if .FirstAccess.TSInexact}} (timestamp inherited){{end}}</div><pre>{{short .FirstAccess.Input 3000}}</pre>{{if .FirstAccess.Reason}}<div class="small mut">{{.FirstAccess.Reason}}</div>{{end}}</div>
-<details><summary>Lead-up: the {{len .Lead}} steps before the access</summary>{{range .Lead}}<div class="step"><div class="h"><span class="badge k-{{.Kind}}">{{kl .Kind}}</span> #{{.Seq}} {{.Tool}} · {{ts .TS}}</div><pre>{{if .Input}}{{short .Input 800}}
+{{with .Prompt}}<div class="step"><div class="h">Most recent human prompt recorded before the first request · #{{.Pos}} · {{ts .TS}}</div><pre>{{short .Text 3000}}</pre></div>{{end}}
+{{with .FirstMention}}<div class="step"><div class="h">First observed mention · #{{.Pos}} · {{kl .Kind}} {{.Tool}} · {{ts .TS}}</div><pre>{{if .Input}}{{short .Input 1500}}
+{{end}}{{short .Text 2500}}</pre></div>{{end}}
+{{with .FirstRequest}}<div class="step"><div class="h">First request · #{{.Pos}} · tool <b>{{.Tool}}</b> · outcome <b>{{.Outcome}}</b> · {{ts .TS}}{{if .TSInexact}} (timestamp inherited){{end}}</div><pre>{{short .Input 3000}}</pre>{{if .Reason}}<div class="small mut">{{.Reason}}</div>{{end}}</div>{{end}}
+{{if .Lead}}<details><summary>The {{len .Lead}} steps recorded before the first request</summary>{{range .Lead}}<div class="step"><div class="h"><span class="badge k-{{.Kind}}">{{kl .Kind}}</span> #{{.Pos}} {{.Tool}}{{if .Outcome}} ({{.Outcome}}){{end}} · {{ts .TS}}</div><pre>{{if .Input}}{{short .Input 800}}
 {{end}}{{short .Text 1200}}</pre></div>{{end}}</details>{{end}}
 </div>{{end}}{{end}}
 
-{{if .Alerts}}<h2>Live policy alerts and denies</h2><div class="card"><table><tr><th>Time</th><th>Agent</th><th>Decision</th><th>Tool</th><th>Reason</th><th>Session</th></tr>
-{{range .Alerts}}<tr class="alert"><td>{{ts .TS}}</td><td>{{.Agent}}</td><td><b>{{.Decision}}</b></td><td>{{.Tool}}</td><td class="small">{{.Reason}}</td><td class="small">{{.SessionID}}</td></tr>{{end}}</table></div>{{end}}
+{{if .Alerts}}<h2>Live policy alerts and denies</h2><div class="card"><table><tr><th>Time</th><th>Host / user</th><th>Agent</th><th>Decision</th><th>Tool</th><th>Reason</th><th>Session</th></tr>
+{{range .Alerts}}<tr class="alert"><td>{{ts .TS}}</td><td class="small">{{.Host}} / {{.User}}</td><td>{{.Agent}}</td><td><b>{{.Decision}}</b></td><td>{{.Tool}}</td><td class="small">{{.Reason}}</td><td class="small">{{.SessionID}}</td></tr>{{end}}</table></div>{{end}}
 
-<h2>Sessions</h2>
+<h2>Record streams</h2>
+<p class="small mut">One stream per input, source, host, user, agent and session ID. Streams are never merged, and positions (#) are local to their source. Timestamps from different sources are not used to infer an order between them.</p>
 {{range .Sessions}}{{$s := .}}<div class="card"><details {{if .Hits}}open{{end}}>
 <summary>{{.Agent}} <span class="mut">({{.Origin}})</span> · {{ts .Start}} {{with dur .Start .End}}· {{.}}{{end}} · {{len .Steps}} steps, {{.Tools}} tool calls{{if .Hits}} · <span class="bad">{{len .Hits}} trace hit(s)</span>{{end}}{{if .Alerts}} · <span class="bad">{{.Alerts}} alert(s)</span>{{end}}</summary>
-<div class="small mut">session {{.SessionID}}{{if .Cwd}} · cwd <code>{{.Cwd}}</code>{{end}}{{if .Model}} · model {{.Model}}{{end}}</div>
-<table><tr><th>#</th><th>Time (UTC)</th><th>Step</th><th>Tool</th><th>Detail</th></tr>
-{{range $i, $e := .Steps}}<tr class="{{if hit $s.Hits $i}}hit{{end}}{{if $e.Decision}} alert{{end}}"><td class="small">{{$e.Seq}}</td><td class="small">{{ts $e.TS}}{{if $e.TSInexact}}*{{end}}</td>
-<td><span class="badge k-{{$e.Kind}}">{{kl $e.Kind}}</span>{{if $e.Decision}} <b class="bad">{{$e.Decision}}</b>{{end}}</td><td><code>{{$e.Tool}}</code></td>
-<td>{{if $e.Command}}<code>$ {{short $e.Command 400}}</code><br>{{end}}{{if and $e.Input (not $e.Command)}}<code class="small">{{short $e.Input 400}}</code><br>{{end}}{{if $e.Text}}<details><summary class="small mut">{{short $e.Text 160}}</summary><pre>{{short $e.Text 8000}}</pre></details>{{end}}{{if $e.Reason}}<div class="small mut">{{$e.Reason}}</div>{{end}}<div class="small mut">{{$e.SourceRef}}</div></td></tr>{{end}}
+<div class="small mut">session {{if .SessionID}}{{.SessionID}}{{else}}<b>none recorded</b>{{end}}{{if .Host}} · host {{.Host}}{{end}}{{if .User}} · user {{.User}}{{end}}{{if .Cwd}} · cwd <code>{{.Cwd}}</code>{{end}}{{if .Model}} · model {{.Model}}{{end}}<br>{{.Prov}}{{if .Source}} · <code>{{.Source}}</code>{{end}}</div>
+<table><tr><th>#</th><th>Time (UTC)</th><th>Step</th><th>Tool</th><th>Outcome / status</th><th>Detail</th></tr>
+{{range $i, $e := .Steps}}<tr class="{{if hit $s.Hits $i}}hit{{end}}{{if $e.Decision}} alert{{end}}"><td class="small">{{$e.Pos}}</td><td class="small">{{ts $e.TS}}{{if $e.TSInexact}}*{{end}}</td>
+<td><span class="badge k-{{$e.Kind}}">{{kl $e.Kind}}</span>{{if $e.Decision}} <b class="bad">{{$e.Decision}}</b>{{end}}</td><td><code>{{$e.Tool}}</code>{{if $e.CallID}}<div class="small mut">{{short $e.CallID 24}}</div>{{end}}</td>
+<td class="small">{{if $e.Outcome}}<b>{{$e.Outcome}}</b>{{end}}{{if $e.Status}}{{$e.Status}}{{end}}</td>
+<td>{{if $e.Command}}<code>$ {{short $e.Command 400}}</code><br>{{end}}{{if and $e.Input (not $e.Command)}}<code class="small">{{short $e.Input 400}}</code><br>{{end}}{{if $e.Text}}<details><summary class="small mut">{{short $e.Text 160}}</summary><pre>{{short $e.Text 8000}}</pre></details>{{end}}{{if $e.Error}}<div class="small bad">{{short $e.Error 400}}</div>{{end}}{{if $e.Reason}}<div class="small mut">{{$e.Reason}}</div>{{end}}<div class="small mut">{{$e.SourceRef}}</div></td></tr>{{end}}
 </table></details></div>{{end}}
 
-{{if .Sources}}<h2>Artifacts examined</h2><div class="card"><table><tr><th>Agent</th><th>Parser</th><th>Path</th><th>Steps</th><th>SHA-256</th><th>Note</th></tr>
-{{range .Sources}}<tr><td>{{.Agent}}</td><td class="small">{{.Parser}}</td><td class="small"><code>{{.Path}}</code></td><td>{{.Events}}</td><td class="small"><code>{{short .SHA256 16}}</code></td><td class="small">{{.Note}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td></tr>{{end}}</table></div>{{end}}
+{{if .Sources}}<h2>Artifacts examined</h2><div class="card"><table><tr><th>Agent</th><th>Parser</th><th>Path</th><th>Steps</th><th>SHA-256</th><th>Notes</th></tr>
+{{range .Sources}}<tr><td>{{.Agent}}</td><td class="small">{{.Parser}}</td><td class="small"><code>{{.Path}}</code>{{if .Files}}<div class="mut">{{len .Files}} file(s) acquired</div>{{end}}</td><td>{{.Events}}</td><td class="small"><code>{{short .SHA256 16}}</code></td><td class="small">{{.Note}}{{if .Malformed}} <span class="bad">{{.Malformed}} malformed record(s)</span>{{end}}{{range .Diags}}<div class="mut">{{.}}</div>{{end}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td></tr>{{end}}</table></div>{{end}}
 
-<p class="small mut">* timestamp inherited from the previous step or the file, not recorded natively for this step. Reasoning shown is only what the model exposed; hidden chain-of-thought is not recoverable.</p>
+<p class="small mut">* timestamp inherited from the previous step or the file, not recorded natively for this step. Outcomes come from vendor-recorded results matched by call ID; a successful result is not proof of every effect implied by a call's arguments. Reasoning shown is only what the model exposed.</p>
 </main></body></html>`
 
 func init() {

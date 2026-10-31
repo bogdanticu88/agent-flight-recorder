@@ -8,42 +8,93 @@ import (
 	"time"
 )
 
-// Finding answers "why did the agent touch X": where X first entered the
-// agent's context, the first time the agent acted on it, and the human prompt
-// in force at that moment.
+// Relation describes how a tool call refers to a trace target.
+const (
+	RelPathArg = "path-argument" // the target is a value of a path-like argument
+	RelCommand = "command"       // the target appears inside a shell command string
+	RelSearch  = "search"        // the target appears in search terms or patterns
+	RelMention = "mention"       // the target appears elsewhere in the call (description, free text)
+)
+
+// Tool categories, inferred from tool names across vendors.
+const (
+	CatRead   = "read"
+	CatWrite  = "write"
+	CatList   = "list"
+	CatSearch = "search"
+	CatShell  = "shell"
+	CatOther  = "other"
+)
+
+// ToolCategory classifies a tool by name. It is a heuristic over vendor
+// naming, used only to decide whether a call can count as file access.
+func ToolCategory(tool string) string {
+	t := strings.ToLower(tool)
+	has := func(subs ...string) bool {
+		for _, s := range subs {
+			if strings.Contains(t, s) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("grep", "search", "glob", "find", "codebase", "ripgrep") || t == "rg":
+		return CatSearch
+	case has("list", "ls_", "readdir", "read_dir") || t == "ls":
+		return CatList
+	case has("bash", "shell", "terminal", "command", "exec", "powershell"):
+		return CatShell
+	case has("write", "edit", "replace", "create_file", "patch", "apply", "insert", "notebook"):
+		return CatWrite
+	case has("read", "view", "open", "cat", "fetch_file", "get_file"):
+		return CatRead
+	}
+	return CatOther
+}
+
+// Finding keeps three observations about a trace target apart: where it was
+// first mentioned, the first tool call that involved it, and the first call
+// whose recorded outcome supports that the target was actually accessed.
 type Finding struct {
-	Target      string
-	Agent       string
-	SessionID   string
-	Introduced  *Event  // first step where the target appears at all
-	FirstAccess *Event  // first tool call that references it
-	Prompt      *Event  // last human prompt before the access
-	Lead        []Event // the steps immediately before the access
-	AllHits     int
-	Verdict     string
+	Target                       string
+	Agent, SessionID, Host, User string
+	Prov, Source                 string
+	Unscoped                     bool
+
+	FirstMention    *Event
+	FirstRequest    *Event
+	RequestRelation string
+	FirstCompletion *Event
+	Prompt          *Event // most recent human prompt recorded before FirstRequest (scoped sessions only)
+	Lead            []Event
+	Hits            int
+	Summary         []string
 }
 
 type SessionView struct {
-	Agent     string
-	SessionID string
-	Origin    string
-	Start     time.Time
-	End       time.Time
-	Cwd       string
-	Model     string
-	Steps     []Event
-	Hits      map[int]bool // index in Steps -> matches a trace target
-	Alerts    int
-	Tools     int
+	Agent, SessionID, Host, User string
+	Origin, Prov, Source         string
+	Unscoped                     bool
+	Start, End                   time.Time
+	Cwd, Model                   string
+	Steps                        []Event
+	Hits                         map[int]bool // index in Steps -> matches a trace target
+	Alerts, Tools                int
+}
+
+// BundleInfo is one input bundle with its own manifest and integrity result.
+type BundleInfo struct {
+	Path     string
+	Manifest *Manifest
+	Check    BundleCheck
 }
 
 type ReportData struct {
 	Title      string
 	Generated  time.Time
-	Manifest   *Manifest
+	Bundles    []BundleInfo
 	Sources    []Source
-	Integrity  []string // problems; empty = verified
-	Verified   bool
 	LiveChains map[string]ChainReport
 	Targets    []string
 	Findings   []Finding
@@ -54,45 +105,140 @@ type ReportData struct {
 
 func normTarget(s string) string { return strings.ToLower(strings.ReplaceAll(s, `\`, "/")) }
 
-// eventMatches checks every text field of a step for the target. For a path,
-// the last two segments are enough (".aws/credentials" matches "~/.aws/credentials"
-// and "C:\Users\x\.aws\credentials"); a bare file name is matched as given.
-func eventMatches(e Event, target string) bool {
+// targetNeedles returns the strings that count as a match: the target itself
+// and, for paths, its last two segments ("~/.aws/credentials" -> ".aws/credentials");
+// for a bare file name, the name.
+func targetNeedles(target string) []string {
 	t := normTarget(target)
-	base := path.Base(t)
-	if strings.Count(strings.Trim(t, "/"), "/") >= 1 {
-		parts := strings.Split(strings.Trim(t, "/"), "/")
-		base = strings.Join(parts[len(parts)-2:], "/")
-	}
-	hay := []string{e.Input, e.Command, e.Text, e.Reason}
-	hay = append(hay, e.Paths...)
-	for _, h := range hay {
-		hn := normTarget(h)
-		if strings.Contains(hn, t) {
-			return true
+	out := []string{t}
+	trimmed := strings.Trim(t, "/")
+	if strings.Contains(trimmed, "/") {
+		parts := strings.Split(trimmed, "/")
+		tail := strings.Join(parts[len(parts)-2:], "/")
+		if tail != t {
+			out = append(out, tail)
 		}
-		if len(base) >= 4 && base != t && strings.Contains(hn, base) {
+	} else if b := path.Base(t); b != t && len(b) >= 4 {
+		out = append(out, b)
+	}
+	return out
+}
+
+func containsTarget(s, target string) bool {
+	hn := normTarget(s)
+	for _, n := range targetNeedles(target) {
+		if n != "" && strings.Contains(hn, n) {
 			return true
 		}
 	}
 	return false
 }
 
-// BuildReport groups steps into sessions and runs trace analysis.
+// eventMatches checks every text field of a step for the target.
+func eventMatches(e Event, target string) bool {
+	for _, h := range append([]string{e.Input, e.Command, e.Text, e.Reason, e.Error}, e.Paths...) {
+		if containsTarget(h, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// relationOf reports how a tool call refers to the target, strongest first.
+func relationOf(e Event, target string) string {
+	in := Decode(e.Input)
+	for _, p := range PathArgs(in) {
+		if containsTarget(p, target) {
+			switch ToolCategory(e.Tool) {
+			case CatSearch:
+				return RelSearch
+			case CatShell:
+				return RelCommand
+			}
+			return RelPathArg
+		}
+	}
+	if e.Command != "" && containsTarget(e.Command, target) {
+		return RelCommand
+	}
+	if m, ok := in.(map[string]any); ok {
+		for k, v := range m {
+			if searchKeys[k] {
+				if s, ok := v.(string); ok && containsTarget(s, target) {
+					return RelSearch
+				}
+			}
+		}
+	}
+	return RelMention
+}
+
+// correlate sets Outcome on every tool call in a session view from its policy
+// decision and the result(s) recorded with the same call ID.
+func correlate(steps []Event) {
+	results := map[string][]int{}
+	unmatched := 0
+	for i, e := range steps {
+		if e.Kind == KindToolResult {
+			if e.CallID != "" {
+				results[e.CallID] = append(results[e.CallID], i)
+			} else {
+				unmatched++
+			}
+		}
+	}
+	for i := range steps {
+		e := &steps[i]
+		if e.Kind != KindToolCall {
+			continue
+		}
+		switch {
+		case e.Decision == "deny":
+			e.Outcome = OutcomeBlocked
+		case e.CallID == "":
+			if unmatched > 0 {
+				e.Outcome = OutcomeUnknown
+			} else {
+				e.Outcome = OutcomeRequested
+			}
+		default:
+			idx := results[e.CallID]
+			if len(idx) == 0 {
+				e.Outcome = OutcomeRequested
+				continue
+			}
+			e.Outcome = OutcomeUnknown
+			for _, j := range idx { // a later definitive status wins over an earlier unknown one
+				switch steps[j].Status {
+				case StatusSuccess:
+					e.Outcome = OutcomeCompleted
+				case StatusError, StatusCancelled:
+					e.Outcome = OutcomeFailed
+				case StatusRejected:
+					e.Outcome = OutcomeBlocked
+				}
+			}
+		}
+	}
+}
+
+// BuildReport groups steps into session views (never merging across hosts,
+// users, inputs or sources), correlates outcomes and runs trace analysis.
 func BuildReport(evs []Event, targets []string) ([]SessionView, []Finding, []Event) {
 	SortEvents(evs)
 	groups := map[string]*SessionView{}
 	var order []string
 	var alerts []Event
 	for _, e := range evs {
-		key := e.Agent + "|" + e.Origin + "|" + e.SessionID
+		key := e.ScopeKey()
 		sv, ok := groups[key]
 		if !ok {
-			sv = &SessionView{Agent: e.Agent, SessionID: e.SessionID, Origin: e.Origin, Start: e.TS, Hits: map[int]bool{}}
+			sv = &SessionView{Agent: e.Agent, SessionID: e.SessionID, Host: e.Host, User: e.User, Origin: e.Origin,
+				Prov: e.Prov, Source: e.Source0(), Unscoped: e.SessionID == "", Start: e.TS, Hits: map[int]bool{}}
 			groups[key] = sv
 			order = append(order, key)
 		}
-		if e.TS.Before(sv.Start) && !e.TS.IsZero() {
+		if !e.TS.IsZero() && (sv.Start.IsZero() || e.TS.Before(sv.Start)) {
 			sv.Start = e.TS
 		}
 		if e.TS.After(sv.End) {
@@ -104,57 +250,25 @@ func BuildReport(evs []Event, targets []string) ([]SessionView, []Finding, []Eve
 		if e.Model != "" {
 			sv.Model = e.Model
 		}
-		if e.Kind == KindToolCall {
-			sv.Tools++
-		}
-		if e.Decision == "alert" || e.Decision == "deny" {
-			sv.Alerts++
-			alerts = append(alerts, e)
-		}
 		sv.Steps = append(sv.Steps, e)
 	}
 	var sessions []SessionView
 	var findings []Finding
 	for _, k := range order {
 		sv := groups[k]
-		sort.SliceStable(sv.Steps, func(i, j int) bool {
-			if sv.Steps[i].Seq != sv.Steps[j].Seq {
-				return sv.Steps[i].Seq < sv.Steps[j].Seq
+		sort.SliceStable(sv.Steps, func(i, j int) bool { return sv.Steps[i].Pos < sv.Steps[j].Pos })
+		correlate(sv.Steps)
+		for _, e := range sv.Steps {
+			if e.Kind == KindToolCall {
+				sv.Tools++
 			}
-			return sv.Steps[i].TS.Before(sv.Steps[j].TS)
-		})
+			if e.Decision == "alert" || e.Decision == "deny" {
+				sv.Alerts++
+				alerts = append(alerts, e)
+			}
+		}
 		for _, t := range targets {
-			f := Finding{Target: t, Agent: sv.Agent, SessionID: sv.SessionID}
-			for i := range sv.Steps {
-				e := sv.Steps[i]
-				if !eventMatches(e, t) {
-					continue
-				}
-				sv.Hits[i] = true
-				f.AllHits++
-				if f.Introduced == nil {
-					ev := e
-					f.Introduced = &ev
-				}
-				if f.FirstAccess == nil && e.Kind == KindToolCall {
-					ev := e
-					f.FirstAccess = &ev
-					for j := i - 1; j >= 0; j-- {
-						if sv.Steps[j].Kind == KindPrompt {
-							p := sv.Steps[j]
-							f.Prompt = &p
-							break
-						}
-					}
-					from := i - 6
-					if from < 0 {
-						from = 0
-					}
-					f.Lead = append([]Event{}, sv.Steps[from:i]...)
-				}
-			}
-			if f.AllHits > 0 {
-				f.Verdict = verdict(f)
+			if f, ok := traceSession(sv, t); ok {
 				findings = append(findings, f)
 			}
 		}
@@ -165,32 +279,144 @@ func BuildReport(evs []Event, targets []string) ([]SessionView, []Finding, []Eve
 		if hi != hj {
 			return hi
 		}
-		return sessions[i].Start.After(sessions[j].Start)
+		if !sessions[i].Start.Equal(sessions[j].Start) {
+			return sessions[i].Start.After(sessions[j].Start)
+		}
+		return sessions[i].Prov+sessions[i].Source+sessions[i].SessionID < sessions[j].Prov+sessions[j].Source+sessions[j].SessionID
 	})
 	return sessions, findings, alerts
 }
 
-func verdict(f Finding) string {
-	switch {
-	case f.FirstAccess == nil && f.Introduced != nil:
-		return fmt.Sprintf("The target appears in this session (%s) but the agent never called a tool on it. It was seen, not opened.", kindLabel(f.Introduced.Kind))
-	case f.Introduced == nil:
-		return ""
-	case f.Introduced.Seq == f.FirstAccess.Seq || f.Introduced.Kind == KindToolCall:
-		if f.Prompt != nil && eventMatches(*f.Prompt, f.Target) {
-			return "The human prompt named the target directly and the agent acted on it."
+func traceSession(sv *SessionView, t string) (Finding, bool) {
+	f := Finding{Target: t, Agent: sv.Agent, SessionID: sv.SessionID, Host: sv.Host, User: sv.User,
+		Prov: sv.Prov, Source: sv.Source, Unscoped: sv.Unscoped}
+	for i := range sv.Steps {
+		e := sv.Steps[i]
+		if !eventMatches(e, t) {
+			continue
 		}
-		return "The agent reached for the target on its own initiative: it appears for the first time in the agent's own tool call, not in anything it was shown before. Check the lead-up steps for what it was looking for (e.g. a broad search for credentials or config)."
-	case f.Introduced.Kind == KindToolResult:
-		return fmt.Sprintf("The target first entered the agent's context through a tool result (step %d: a file it read, a search hit or a directory listing). The agent then chose to open it (step %d). Discovery first, then access.", f.Introduced.Seq, f.FirstAccess.Seq)
-	case f.Introduced.Kind == KindPrompt:
-		return fmt.Sprintf("The human prompt referenced the target (step %d) before the agent opened it (step %d).", f.Introduced.Seq, f.FirstAccess.Seq)
-	case f.Introduced.Kind == KindContext:
-		return fmt.Sprintf("The target was introduced by injected context (step %d: instructions, attachments or environment) before the agent opened it (step %d). Review that context for prompt injection.", f.Introduced.Seq, f.FirstAccess.Seq)
-	case f.Introduced.Kind == KindReasoning || f.Introduced.Kind == KindResponse:
-		return fmt.Sprintf("The model mentioned the target in its own reasoning or reply (step %d) before opening it (step %d).", f.Introduced.Seq, f.FirstAccess.Seq)
+		sv.Hits[i] = true
+		f.Hits++
+		if f.FirstMention == nil {
+			ev := e
+			f.FirstMention = &ev
+		}
+		if e.Kind != KindToolCall {
+			continue
+		}
+		rel := relationOf(e, t)
+		if f.FirstRequest == nil {
+			ev := e
+			f.FirstRequest = &ev
+			f.RequestRelation = rel
+			if !sv.Unscoped {
+				for j := i - 1; j >= 0; j-- {
+					if sv.Steps[j].Kind == KindPrompt {
+						p := sv.Steps[j]
+						f.Prompt = &p
+						break
+					}
+				}
+			}
+			from := i - 6
+			if from < 0 {
+				from = 0
+			}
+			f.Lead = append([]Event{}, sv.Steps[from:i]...)
+		}
+		cat := ToolCategory(e.Tool)
+		if f.FirstCompletion == nil && rel == RelPathArg && e.Outcome == OutcomeCompleted && (cat == CatRead || cat == CatWrite) {
+			ev := e
+			f.FirstCompletion = &ev
+		}
 	}
-	return ""
+	if f.Hits == 0 {
+		return f, false
+	}
+	f.Summary = summarise(f, sv.Steps)
+	return f, true
+}
+
+func at(e *Event) string {
+	s := fmt.Sprintf("#%d", e.Pos)
+	if e.SourceRef != "" {
+		s += " (" + e.SourceRef + ")"
+	}
+	return s
+}
+
+func relationPhrase(rel string) string {
+	switch rel {
+	case RelPathArg:
+		return "as a path argument"
+	case RelCommand:
+		return "inside a shell command"
+	case RelSearch:
+		return "in search terms or patterns"
+	}
+	return "only in the call's description or free text"
+}
+
+func outcomeBasis(e *Event, steps []Event) string {
+	switch e.Outcome {
+	case OutcomeBlocked:
+		if e.Decision == "deny" {
+			return "denied by policy before it ran"
+		}
+		return "the recorded result says the call was declined"
+	case OutcomeFailed:
+		return "the correlated result reports an error"
+	case OutcomeCompleted:
+		return "the correlated result reports success"
+	case OutcomeRequested:
+		return "no result is recorded for this call"
+	}
+	if e.CallID == "" {
+		return "the call has no ID, so recorded results cannot be matched to it"
+	}
+	return "a result is recorded but without a success or error status"
+}
+
+// summarise states what the captured record shows, in order, without claims
+// about intent or responsibility.
+func summarise(f Finding, steps []Event) []string {
+	var out []string
+	m := f.FirstMention
+	out = append(out, fmt.Sprintf("First observed mention: %s at %s.", kindLabel(m.Kind), at(m)))
+	if f.FirstRequest == nil {
+		out = append(out, "No tool call involving the target is recorded in this session.")
+		return out
+	}
+	r := f.FirstRequest
+	out = append(out, fmt.Sprintf("First request involving the target: %s at %s, with the target %s. Outcome: %s (%s).",
+		r.Tool, at(r), relationPhrase(f.RequestRelation), r.Outcome, outcomeBasis(r, steps)))
+	if c := f.FirstCompletion; c != nil {
+		verb := "read"
+		if ToolCategory(c.Tool) == CatWrite {
+			verb = "written or modified"
+		}
+		out = append(out, fmt.Sprintf("Supported completion: %s at %s names the target as a path argument and its correlated result reports success. This supports that the target was %s through that call.",
+			c.Tool, at(c), verb))
+	} else {
+		s := "No completed read or write call with the target as a path argument is recorded, so the record does not establish that the target was accessed."
+		if r.Outcome == OutcomeCompleted && f.RequestRelation == RelCommand {
+			s += " The shell command referencing it reports success, but what that command did to the target is not established by the record."
+		}
+		out = append(out, s)
+	}
+	if m.Pos == r.Pos {
+		out = append(out, "No earlier mention of the target is observed in the available evidence for this session. Earlier context may exist that was not captured (compacted history, deleted turns, or attachments and instructions loaded outside the transcript).")
+	} else {
+		s := fmt.Sprintf("The earliest observed mention (%s) comes before the first request.", kindLabel(m.Kind))
+		if m.Kind == KindContext {
+			s += " That content was loaded into the agent's context; review it for instructions aimed at the agent."
+		}
+		out = append(out, s)
+	}
+	if f.Unscoped {
+		out = append(out, "These events carry no session ID; they are listed together because they share a source, not because they are known to belong to one session.")
+	}
+	return out
 }
 
 func kindLabel(k Kind) string {
