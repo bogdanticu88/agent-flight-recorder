@@ -214,17 +214,15 @@ func relationOf(e Event, target string) string {
 func correlate(steps []Event, unscoped bool) {
 	calls := map[string]int{}
 	results := map[string][]int{}
-	unmatched := 0
 	for i, e := range steps {
 		switch {
 		case e.Kind == KindToolCall && e.CallID != "":
 			calls[e.CallID]++
 		case e.Kind == KindToolResult && e.CallID != "":
 			results[e.CallID] = append(results[e.CallID], i)
-		case e.Kind == KindToolResult:
-			unmatched++
 		}
 	}
+	byArgs, noteArgs, opaque := matchByArgs(steps, unscoped)
 	for i := range steps {
 		e := &steps[i]
 		if e.Kind != KindToolCall {
@@ -236,9 +234,19 @@ func correlate(steps []Event, unscoped bool) {
 			continue
 		}
 		if e.CallID == "" {
-			if unmatched > 0 {
+			switch {
+			case noteArgs[i] != "":
+				e.Outcome, e.OutcomeNote = OutcomeUnknown, noteArgs[i]
+			case byArgs[i] >= 0:
+				e.Outcome = outcomeOf(steps[byArgs[i]].Status)
+				if e.Outcome == OutcomeUnknown {
+					e.OutcomeNote = "a result is recorded but without a success or error status"
+				} else {
+					e.OutcomeNote = "matched to its result by identical tool name and arguments; the agent records no call ID"
+				}
+			case opaque > 0:
 				e.Outcome, e.OutcomeNote = OutcomeUnknown, "the call has no ID, so recorded results cannot be matched to it"
-			} else {
+			default:
 				e.Outcome = OutcomeRequested
 			}
 			continue
@@ -282,6 +290,66 @@ func correlate(steps []Event, unscoped bool) {
 			e.Outcome, e.OutcomeNote = OutcomeUnknown, "results recorded for this call report conflicting statuses"
 		}
 	}
+}
+
+// outcomeOf maps a result status to a call outcome.
+func outcomeOf(status string) string {
+	switch status {
+	case StatusSuccess:
+		return OutcomeCompleted
+	case StatusError, StatusCancelled:
+		return OutcomeFailed
+	case StatusRejected:
+		return OutcomeBlocked
+	}
+	return OutcomeUnknown
+}
+
+// matchByArgs pairs calls and results that carry no call ID (Copilot hooks
+// send none) by identical tool name and arguments, in stream order. A
+// result is attributed only when exactly one earlier call with the same
+// tool and arguments is still open; otherwise every open candidate is
+// marked ambiguous. Results without arguments cannot be matched and are
+// counted as opaque. In streams without a session ID nothing is matched.
+func matchByArgs(steps []Event, unscoped bool) (match map[int]int, note map[int]string, opaque int) {
+	match, note = map[int]int{}, map[int]string{}
+	for i, e := range steps {
+		if e.Kind == KindToolCall && e.CallID == "" {
+			match[i] = -1
+		}
+	}
+	open := map[string][]int{}
+	for i, e := range steps {
+		if e.CallID != "" {
+			continue
+		}
+		key := e.Tool + "\x00" + e.Input
+		switch e.Kind {
+		case KindToolCall:
+			if e.Decision != "deny" {
+				open[key] = append(open[key], i)
+			}
+		case KindToolResult:
+			if e.Input == "" || e.Tool == "" || unscoped {
+				opaque++
+				continue
+			}
+			cands := open[key]
+			switch len(cands) {
+			case 0:
+				opaque++
+			case 1:
+				match[cands[0]] = i
+				delete(open, key)
+			default:
+				for _, c := range cands {
+					note[c] = fmt.Sprintf("%d open calls have the same tool and arguments and the agent records no call ID, so results cannot be matched to one of them", len(cands))
+				}
+				delete(open, key)
+			}
+		}
+	}
+	return match, note, opaque
 }
 
 // BuildReport groups steps into session views (never merging across hosts,
