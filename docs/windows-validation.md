@@ -2,6 +2,14 @@
 
 What has actually been run on a Windows host, and what that does not cover.
 
+## Run 5 (commit 91e58a6), 1 November 2026
+
+Same host and setup. Result: 99 pass, 0 fail, 1 skip (race), 2 documented
+gaps. With the synthetic sessions seeded into the standard user's profile,
+the unelevated `Invoke-AFRCollect.ps1` run finds all 48 steps, the same as
+the elevated collection, and the bundle verifies and is labelled user mode.
+This closes the gap noted under run 4.
+
 ## Run 4 (commit b487bd8), 1 November 2026
 
 Same host and setup as run 3. Result: 98 pass, 0 fail, 1 skip (race), the
