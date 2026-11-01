@@ -12,12 +12,15 @@
       own     work on this user's own log: appends, verify, attacks on it,
               concurrency, lock contention, stale lock recovery, termination
       other   attack another user's existing log
-      squat   create a log under another user's name before that user does
-      victim  try to record into a log another user has squatted
+      squat   try to create a log in another user's log folder, or any file
+              or folder at the log root
+      victim  record into this user's own log after the squat attempt
+      fallback record when this user's central log folder does not exist:
+              the hook must fall back to the local log and say so
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet("own", "other", "squat", "victim")][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet("own", "other", "squat", "victim", "fallback")][string]$Mode,
     [Parameter(Mandatory)][string]$Afr,
     [Parameter(Mandatory)][string]$LogPath,
     [Parameter(Mandatory)][string]$ResultFile,
@@ -238,22 +241,45 @@ switch ($Mode) {
         $read = Test-Op -Name "read" -Op { [IO.File]::ReadAllText($LogPath) }
         Compare-Result -Name "other user's log read" -Expected "denied" -Actual $read[0] -Details $read[1]
         $r = Invoke-Hook
-        $got = if ($r.StdErr -match "recording failed") { "denied" } else { "allowed" }
+        $got = if ($r.StdErr -match "recording failed|is unavailable") { "denied" } else { "allowed" }
         Compare-Result -Name "other user's log append via afr" -Expected "denied" -Actual $got -Details $r.StdErr
         Test-Attacks -Target $LogPath -Prefix "other user's log"
     }
 
     "squat" {
         $r = Invoke-Hook
-        $got = if ($r.ExitCode -eq 0 -and $r.StdErr -notmatch "recording failed") { "allowed" } else { "denied" }
-        # documented gap: the expected (current) behaviour is that this succeeds
-        Add-Result -Name "pre-create another user's log name" -Expected "allowed (documented gap)" -Actual $got -Status $(if ($got -eq "allowed") { "GAP" } else { "PASS" }) -Details ("exit {0}; stderr: {1}" -f $r.ExitCode, $r.StdErr)
+        # refused centrally shows as a fallback note; a write would show nothing
+        $got = if ($r.StdErr -match "is unavailable|recording failed") { "denied" } elseif ($r.ExitCode -eq 0) { "allowed" } else { "error" }
+        Compare-Result -Name "create a log in another user's log folder" -Expected "denied" -Actual $got -Details ("exit {0}; stderr: {1}" -f $r.ExitCode, $r.StdErr)
+        $root = Split-Path (Split-Path $LogPath)
+        $f = Test-Op -Name "root-file" -Op { [IO.File]::WriteAllText((Join-Path $root ("squat-" + [guid]::NewGuid().ToString("N") + ".jsonl")), "x") }
+        Compare-Result -Name "create a file at the log root" -Expected "denied" -Actual $f[0] -Details $f[1]
+        $d = Test-Op -Name "root-dir" -Op { New-Item -ItemType Directory -Path (Join-Path $root ("squat-" + [guid]::NewGuid().ToString("N"))) -ErrorAction Stop }
+        Compare-Result -Name "create a folder at the log root" -Expected "denied" -Actual $d[0] -Details $d[1]
     }
 
     "victim" {
         $r = Invoke-Hook
-        $got = if ($r.StdErr -match "recording failed") { "recording failed" } else { "recorded" }
-        Add-Result -Name "victim records into a squatted log" -Expected "recording failed (documented gap)" -Actual $got -Status $(if ($got -eq "recording failed") { "GAP" } else { "FAIL" }) -Details $r.StdErr
-        Compare-Result -Name "victim hook still exits 0 (fail-open default)" -Expected "0" -Actual ([string]$r.ExitCode)
+        $got = if ($r.StdErr -match "recording failed|is unavailable") { "not recorded centrally" } else { "recorded" }
+        Compare-Result -Name "user records into own log after a squat attempt" -Expected "recorded" -Actual $got -Details $r.StdErr
+        Compare-Result -Name "hook exits 0" -Expected "0" -Actual ([string]$r.ExitCode)
+        $v = Get-Verify
+        Compare-Result -Name "own log verifies after the squat attempt" -Expected "CONSISTENT/1" -Actual ("{0}/{1}" -f $v.Status, $v.Records) -Details $v.Raw
+    }
+
+    "fallback" {
+        $fb = Join-Path $env:LOCALAPPDATA "AgentFlightRecorder\events.jsonl"
+        $before = if (Test-Path -LiteralPath $fb) { @(Get-Content -LiteralPath $fb).Count } else { 0 }
+        $r = Invoke-Hook
+        Compare-Result -Name "hook exits 0 when the central folder is missing" -Expected "0" -Actual ([string]$r.ExitCode) -Details $r.StdErr
+        $said = if ($r.StdErr -match "local fallback log") { "says so" } else { "silent" }
+        Compare-Result -Name "hook reports the fallback on stderr" -Expected "says so" -Actual $said -Details $r.StdErr
+        $after = if (Test-Path -LiteralPath $fb) { @(Get-Content -LiteralPath $fb).Count } else { 0 }
+        Compare-Result -Name "record written to the local fallback log" -Expected "1" -Actual ([string]($after - $before)) -Details $fb
+        $central = $LogPath
+        $script:LogPath = $fb
+        $v = Get-Verify
+        $script:LogPath = $central
+        Compare-Result -Name "fallback log verifies" -Expected "CONSISTENT" -Actual $v.Status -Details $v.Raw
     }
 }

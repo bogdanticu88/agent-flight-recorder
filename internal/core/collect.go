@@ -380,8 +380,25 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 		liveScope.Bases = append(append([]string{}, scope.Bases...), resolveDir(filepath.Dir(lp)))
 	case o.Root == "":
 		if mp := managedLogPath(o.Roots); mp != "" {
-			lp = mp
-			liveScope.Bases = append(append([]string{}, scope.Bases...), resolveDir(filepath.Dir(lp)))
+			// The hook falls back to the user's own log when the central one
+			// is unavailable (no per-user folder yet, or a file squatted by
+			// another user). Use it when the central log is absent, and say
+			// so either way: it is user-writable, weaker evidence.
+			fb := FallbackLogPath(o.Roots)
+			_, cerr := os.Stat(mp)
+			_, ferr := os.Stat(fb)
+			switch {
+			case errors.Is(cerr, os.ErrNotExist) && ferr == nil:
+				m.Skipped = append(m.Skipped, "live log: the central log "+mp+" does not exist; collected the user's local fallback log "+fb+" instead, which the user can modify")
+			case ferr == nil:
+				lp = mp
+				m.Skipped = append(m.Skipped, "live log: a local fallback log also exists at "+fb+" (the central log was unavailable at some point); collect it separately with --live-log")
+			default:
+				lp = mp
+			}
+			if lp == mp {
+				liveScope.Bases = append(append([]string{}, scope.Bases...), resolveDir(filepath.Dir(lp)))
+			}
 		}
 	}
 	if real, _, err := liveScope.Check(lp); err == nil {

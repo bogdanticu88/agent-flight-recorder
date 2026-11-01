@@ -2,7 +2,8 @@
 
 The hook recorder writes one JSON object per line. With the machine policy from
 `Install-AFR.ps1`, every user's events land in
-`C:\ProgramData\AgentFlightRecorder\logs\<username>.jsonl`. The Azure Monitor
+`C:\ProgramData\AgentFlightRecorder\logs\<profile>\events.jsonl`, one folder per
+user that only that user can create files in. The Azure Monitor
 Agent (AMA) picks those files up and sends them to a custom table.
 
 The local file is the working copy. The Sentinel copy is the record you trust.
@@ -33,7 +34,10 @@ named `AgentFlightRecorder_CL` with these columns (all `string` unless noted):
 
 Data source type: **Custom JSON Logs**
 
-- File pattern: `C:\ProgramData\AgentFlightRecorder\logs\*.jsonl`
+- File pattern: `C:\ProgramData\AgentFlightRecorder\logs\*\events.jsonl`
+  (AMA allows a wildcard in the first folder above the file name). Add a
+  `FilePath` column to the table: the folder name identifies whose log a
+  record came from, independently of the `user` field inside it.
 - Table: `AgentFlightRecorder_CL`
 - Transform:
 

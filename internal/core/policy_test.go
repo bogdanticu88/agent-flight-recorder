@@ -1,10 +1,12 @@
 package core
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const preRead = `{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Read","tool_input":{"file_path":"/h/.ssh/id_rsa"}}`
@@ -173,6 +175,8 @@ func TestRecordingFailureIsNotReportedAsLogged(t *testing.T) {
 	blocker := filepath.Join(home, "file")
 	writeFile(t, blocker, "x")
 	t.Setenv("AFR_LOG", filepath.Join(blocker, "sub", "events.jsonl")) // parent is a file: cannot create
+	// and the local fallback cannot be created either
+	writeFile(t, filepath.Dir(FallbackLogPath(RootsFor(home))), "x")
 	p := filepath.Join(home, "p.json")
 	writeFile(t, p, `{"rules":[{"pattern":"**/.ssh/**","action":"deny","label":"ssh"}]}`)
 	t.Setenv("AFR_POLICY", p)
@@ -230,3 +234,74 @@ func TestVendorDenyProtocols(t *testing.T) {
 		}
 	}
 }
+
+// A missing per-user log folder, or a log someone else created first, must not
+// silently stop recording: the hook falls back to the user's own log and says so.
+func TestUnavailableLogFallsBackToLocalLog(t *testing.T) {
+	home := isolate(t)
+	blocker := filepath.Join(home, "file")
+	writeFile(t, blocker, "x")
+	central := filepath.Join(blocker, "sub", "events.jsonl")
+	t.Setenv("AFR_LOG", central)
+	p := filepath.Join(home, "p.json")
+	writeFile(t, p, `{"fail_closed":true,"rules":[{"pattern":"**/.ssh/**","action":"deny","label":"ssh"}]}`)
+	t.Setenv("AFR_POLICY", p)
+
+	r := hook(t, home, "claude-code", preRead)
+	if !denied(r) {
+		t.Fatal("deny must still be enforced")
+	}
+	mustContain(t, r.Stdout, "was recorded")
+	mustContain(t, r.Stderr, "local fallback log")
+	mustContain(t, r.Stderr, "the user can modify")
+	mustNotContain(t, r.Stderr, "recording failed")
+
+	ok := `{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}`
+	if r := hook(t, home, "claude-code", ok); denied(r) {
+		t.Fatal("fail_closed must not deny when the fallback recorded the call")
+	}
+	f, err := os.Open(FallbackLogPath(RootsFor(home)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	evs, rep := VerifyLiveLog(f)
+	if !rep.OK() || len(evs) != 2 {
+		t.Fatalf("fallback log: %d records, %+v", len(evs), rep)
+	}
+}
+
+func TestCollectorUsesFallbackWhenCentralLogMissing(t *testing.T) {
+	home := isolate(t)
+	central := filepath.Join(t.TempDir(), "logs", "someone", "events.jsonl")
+	writeFile(t, filepath.Join(machineDir(), "policy.json"), `{"log_path":`+jsonQuote(central)+`}`)
+	ev := Event{TS: t0, Agent: "claude-code", Origin: "live", SessionID: "fb", Kind: KindPrompt, Text: "recorded while the central log was unavailable"}
+	if err := AppendLive(FallbackLogPath(RootsFor(home)), &ev, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, m := collectTo(t, CollectOptions{Roots: RootsFor(home), From: t0.Add(-time.Hour), To: t0.Add(time.Hour)})
+	if m.LiveLog == nil || m.LiveLog.InWindow != 1 {
+		t.Fatalf("fallback log not collected: %+v", m.LiveLog)
+	}
+	mustContain(t, strings.Join(m.Skipped, "\n"), "local fallback log")
+	all := ""
+	for _, e := range readZip(t, p) {
+		all += string(e.data)
+	}
+	mustContain(t, all, "recorded while the central log was unavailable")
+
+	// central present as well: central is collected, the fallback is pointed out
+	ev2 := Event{TS: t0, Agent: "claude-code", Origin: "live", SessionID: "c", Kind: KindPrompt, Text: "central record"}
+	if err := AppendLive(central, &ev2, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, m = collectTo(t, CollectOptions{Roots: RootsFor(home), From: t0.Add(-time.Hour), To: t0.Add(time.Hour)})
+	all = ""
+	for _, e := range readZip(t, p) {
+		all += string(e.data)
+	}
+	mustContain(t, all, "central record")
+	mustContain(t, strings.Join(m.Skipped, "\n"), "collect it separately with --live-log")
+}
+
+func jsonQuote(s string) string { b, _ := json.Marshal(s); return string(b) }

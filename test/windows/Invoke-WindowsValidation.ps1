@@ -279,7 +279,7 @@ if ($SkipDeployScripts) {
     $prof = Join-Path $U "profiles"
     New-Item -ItemType Directory -Force -Path $src, (Join-Path $prof "alice $Uni"), (Join-Path $prof "bob") | Out-Null
     Copy-Item -LiteralPath $Afr -Destination (Join-Path $src "afr.exe") -Force
-    $pol = [ordered]@{ log_path = (Join-Path $Logs "%USERNAME%.jsonl"); rules = @(@{ pattern = "**/.ssh/**"; action = "deny"; label = "ssh" }) }
+    $pol = [ordered]@{ log_path = (Join-Path $Logs "%USERNAME%\events.jsonl"); rules = @(@{ pattern = "**/.ssh/**"; action = "deny"; label = "ssh" }) }
     [IO.File]::WriteAllText((Join-Path $src "policy.json"), ($pol | ConvertTo-Json -Depth 4), $utf8)
     $installArgs = @("-Source", $src, "-ProgramDir", (Join-Path $U "prog"), "-DataDir", $Data, "-ProfilesRoot", $prof, "-SkipMachineHooks")
     $installer = Join-Path $RepoRoot "deploy\windows\Install-AFR.ps1"
@@ -310,6 +310,7 @@ if ($SkipDeployScripts) {
     }
     $usersRights = Get-Rights "S-1-5-32-545"
     Compare-Result $phase "Users cannot delete children of the log folder" "True" ([string](([int]$usersRights -band [int]$R::DeleteSubdirectoriesAndFiles) -eq 0)) ([string]$usersRights)
+    Compare-Result $phase "Users cannot create files or folders at the log root" "True" ([string](([int]$usersRights -band ([int]$R::CreateFiles -bor [int]$R::CreateDirectories)) -eq 0)) ([string]$usersRights)
     Compare-Result $phase "log folder does not inherit parent ACEs" "True" ([string]$acl.AreAccessRulesProtected) ""
 
     # collection script against the fixture profile, output to a temp folder
@@ -404,6 +405,28 @@ if ($SkipAccounts) {
             $sid = (Get-LocalUser -Name $name).SID.Value
             $null = & icacls.exe $scratch /grant "*${sid}:(OI)(CI)M"
         }
+        # Log on each account once so Windows creates its profile, then run the
+        # installer again, as a scheduled remediation would, so it creates their
+        # per-user log folders.
+        foreach ($name in @($creds.Keys)) {
+            Start-Process -FilePath (Join-Path $env:SystemRoot "System32\cmd.exe") -ArgumentList "/c exit 0" -Credential $creds[$name] -LoadUserProfile `
+                -WorkingDirectory $env:SystemRoot -WindowStyle Hidden -Wait
+        }
+        $r = Invoke-Script $PS51 $installer $installArgs "deploy-install-3"
+        Compare-Result $phase "installer rerun after the accounts exist" "0" ([string]$r.ExitCode) ($r.StdOut + $r.StdErr)
+        foreach ($name in @("${UserPrefix}1", "${UserPrefix}2")) {
+            $d = Join-Path $Logs $name
+            $sid = (Get-LocalUser -Name $name).SID.Value
+            $ok = $false
+            if (Test-Path -LiteralPath $d) {
+                $rules = (Get-Acl -LiteralPath $d).Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $sid -and $_.AccessControlType -eq "Allow" }
+                $x = 0; foreach ($ru in $rules) { $x = $x -bor [int]$ru.FileSystemRights }
+                $ok = (($x -band [int][Security.AccessControl.FileSystemRights]::CreateFiles) -ne 0) -and (($x -band [int][Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -eq 0)
+                & icacls.exe $d | Out-File -Encoding utf8 (Join-Path $Ev "acl-logdir-$name.txt")
+            }
+            Compare-Result $phase "per-user log folder for $name, create-files for its SID only" "True" ([string]$ok) $d
+        }
+
         # The repository may sit inside an administrator's profile, which the test
         # accounts cannot read; give them a copy under the work root.
         $userScript = Join-Path $WorkRoot "scripts\Test-RecorderAsUser.ps1"
@@ -417,12 +440,14 @@ if ($SkipAccounts) {
                 -RedirectStandardOutput (Join-Path $Ev "user-$name-$mode.out.txt") -RedirectStandardError (Join-Path $Ev "user-$name-$mode.err.txt") -Wait -PassThru
             Add-Result $phase "$name ran mode $mode" "0" ([string]$p.ExitCode) "INFO" "see evidence\user-$name-$mode.*.txt"
         }
-        $victimLog = Join-Path $Logs "${UserPrefix}1.jsonl"
-        $ownLog = Join-Path $Logs "${UserPrefix}1-own.jsonl"
+        $victimLog = Join-Path $Logs "${UserPrefix}1\events.jsonl"
+        $ownLog = Join-Path $Logs "${UserPrefix}1\own.jsonl"
+        $noFolderLog = Join-Path $Logs "nobody-$([guid]::NewGuid().ToString('N').Substring(0, 8))\events.jsonl"
         Invoke-AsUser "${UserPrefix}2" "squat" $victimLog
         Invoke-AsUser "${UserPrefix}1" "victim" $victimLog
         Invoke-AsUser "${UserPrefix}1" "own" $ownLog
         Invoke-AsUser "${UserPrefix}2" "other" $ownLog
+        Invoke-AsUser "${UserPrefix}1" "fallback" $noFolderLog
 
         # the collection script as the person under review would run it: no
         # admin rights, no arguments beyond the window
@@ -487,7 +512,7 @@ if ($SkipAccounts) {
             else { Add-Result $phase "$name produced results" "results.jsonl" "missing" "FAIL" "the user-side script did not run; see evidence\user-$name-*.err.txt" }
         }
         # ownership and effective ACL of the files the users created
-        foreach ($pair in @(@($ownLog, "${UserPrefix}1"), @($victimLog, "${UserPrefix}2"))) {
+        foreach ($pair in @(@($ownLog, "${UserPrefix}1"), @($victimLog, "${UserPrefix}1"))) {
             if (Test-Path -LiteralPath $pair[0]) {
                 $ownerSid = (Get-Acl -LiteralPath $pair[0]).GetOwner([Security.Principal.SecurityIdentifier]).Value
                 $wantSid = (Get-LocalUser -Name $pair[1]).SID.Value

@@ -1,5 +1,5 @@
 {
-  "log_path": "C:\\ProgramData\\AgentFlightRecorder\\logs\\%USERNAME%.jsonl",
+  "log_path": "C:\\ProgramData\\AgentFlightRecorder\\logs\\%USERNAME%\\events.jsonl",
   "max_text": 8000,
   "capture_results": true,
   "fail_closed": false,

@@ -522,6 +522,16 @@ func RunHook(agent, eventName string, stdin io.Reader, r Roots) HookResult {
 	RedactEvent(&e)
 	TruncateEvent(&e, maxText(pol))
 	appendErr := AppendLive(logPath, &e, lockDir(r))
+	var unavailable *LogUnavailableError
+	if errors.As(appendErr, &unavailable) {
+		if fb := FallbackLogPath(r); fb != logPath {
+			fe := e
+			if err := AppendLive(fb, &fe, lockDir(r)); err == nil || errors.As(err, new(*ChainResumedError)) {
+				problems = append(problems, fmt.Sprintf("log %s is unavailable (%v); recorded to the local fallback log %s instead, which the user can modify", logPath, unavailable.Err, fb))
+				appendErr = nil
+			}
+		}
+	}
 	var resumed *ChainResumedError
 	if errors.As(appendErr, &resumed) {
 		problems = append(problems, resumed.Error())
@@ -612,7 +622,7 @@ func lockDir(r Roots) string { return filepath.Join(userStateDir(r), "locks") }
 // processes can fire at once (parallel tool calls), so appends take a lock file.
 func AppendLive(path string, e *Event, lockDirectory string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return &LogUnavailableError{Path: path, Err: err}
 	}
 	if lockDirectory == "" {
 		lockDirectory = filepath.Dir(path)
@@ -628,7 +638,7 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 	defer unlock()
 	prev, torn, needNL, err := lastHash(path)
 	if err != nil {
-		return err
+		return &LogUnavailableError{Path: path, Err: err}
 	}
 	e.PrevHash = prev
 	if torn {
@@ -645,7 +655,7 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 	}
 	f, err := openAppend(path)
 	if err != nil {
-		return err
+		return &LogUnavailableError{Path: path, Err: err}
 	}
 	if _, err := f.Write(append(b, '\n')); err != nil {
 		f.Close()
@@ -659,6 +669,23 @@ func AppendLive(path string, e *Event, lockDirectory string) error {
 	}
 	return nil
 }
+
+// LogUnavailableError means nothing was written because the log could not be
+// created, read or opened for append: a missing per-user log folder, or a log
+// file that belongs to someone else. The hook then records to the user's
+// local fallback log instead.
+type LogUnavailableError struct {
+	Path string
+	Err  error
+}
+
+func (e *LogUnavailableError) Error() string { return e.Err.Error() }
+func (e *LogUnavailableError) Unwrap() error { return e.Err }
+
+// FallbackLogPath is the per-user log the hook writes to when the configured
+// log is unavailable. It lives in the user's own profile, so it is weaker
+// evidence than the central log: the user can edit or delete it.
+func FallbackLogPath(r Roots) string { return filepath.Join(userStateDir(r), "events.jsonl") }
 
 // TornTailPrevHash is written as prev_hash when the log's last line could not
 // be parsed (typically a writer killed mid-record). It is deliberately not a
