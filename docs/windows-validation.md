@@ -1,5 +1,27 @@
 # Windows validation record
 
+## Per-user log folders (commit 02b9d74), GitHub Actions, 1 November 2026
+
+Windows Server 2025 runner, `windows-validation` job, suite run as two
+standard users created by the suite. All recorder, deploy and collect-user
+checks pass; the two failures in that run were the raw-copy naming test
+(fixed in dc127a4, see below), under `go test` and `go test -race`.
+
+- The log root no longer lets Users create files or folders.
+- The installer, rerun once the test accounts had profiles, created a
+  folder for each with create-files for that SID only.
+- As afrval2: creating a log in afrval1's folder, a file at the log root
+  and a folder at the log root are all refused.
+- afrval1 then records into its own folder normally; the chain verifies.
+- A user with no folder is recorded to the local fallback log, the hook
+  exits 0 and says so on stderr, and the fallback log verifies.
+- The race detector ran on Windows (the runner has gcc); the only failure
+  was the same naming test, no data race reported.
+
+This closes the log-name squatting gap found in runs 1 to 5 below. It has
+not yet been rerun on the Windows 11 host.
+
+
 What has actually been run on a Windows host, and what that does not cover.
 
 ## Run 5 (commit 91e58a6), 1 November 2026
