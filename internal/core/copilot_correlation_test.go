@@ -78,3 +78,35 @@ func TestCopilotCallsWithoutIDsMatchResultsByArguments(t *testing.T) {
 		}
 	}
 }
+
+// The Copilot transcript records a call refused by a preToolUse hook as a
+// failed execution whose error says so. Seen on a real VS Code session: the
+// live log said blocked, the transcript parser said failed.
+func TestCopilotTranscriptHookDenialIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/session-state/s1/events.jsonl"
+	deny := "Denied by preToolUse hook: Tool call denied: blocked by security policy (Test: dummy credentials). This attempt was recorded."
+	writeFile(t, p, jsonl(t,
+		map[string]any{"type": "tool.execution_start", "timestamp": "2026-11-01T10:16:31Z", "data": map[string]any{"toolCallId": "t1", "toolName": "view", "arguments": map[string]any{"path": target}}},
+		map[string]any{"type": "tool.execution_complete", "timestamp": "2026-11-01T10:16:31Z", "data": map[string]any{"toolCallId": "t1", "success": false, "error": map[string]any{"message": deny}}},
+		map[string]any{"type": "tool.execution_start", "timestamp": "2026-11-01T10:16:40Z", "data": map[string]any{"toolCallId": "t2", "toolName": "view", "arguments": map[string]any{"path": "/w/missing"}}},
+		map[string]any{"type": "tool.execution_complete", "timestamp": "2026-11-01T10:16:41Z", "data": map[string]any{"toolCallId": "t2", "success": false, "error": "ENOENT: no such file"}},
+	))
+	res, err := ParseSource(Source{Agent: "copilot-cli", Parser: "copilot-cli", Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range res.Events {
+		res.Events[i].Prov = "t"
+	}
+	f := traceOne(t, res.Events)
+	if f.FirstRequest == nil || f.FirstRequest.Outcome != OutcomeBlocked {
+		t.Fatalf("hook denial in transcript: want blocked, got %+v", f.FirstRequest)
+	}
+	views, _, _ := BuildReport(res.Events, nil)
+	for _, s := range views[0].Steps {
+		if s.Kind == KindToolCall && s.CallID == "t2" && s.Outcome != OutcomeFailed {
+			t.Fatalf("an ordinary error must stay failed, got %s", s.Outcome)
+		}
+	}
+}

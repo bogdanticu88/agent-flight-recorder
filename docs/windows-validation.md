@@ -118,5 +118,11 @@ Open:
   attached" message, not the user's prompt. User-scope hooks
   (`~/.copilot/hooks`), which the installer writes, would not have this gap.
 - The offline side found the workspace's `state.vscdb` but no chat
-  transcript in it; Copilot-target sessions are stored elsewhere. Not yet
-  located.
+  transcript in it. Copilot-target sessions from VS Code are stored with
+  Copilot CLI's, under `~/.copilot/session-state/<id>/events.jsonl`, and
+  afr's existing parser reads them: 198 steps from the same session,
+  including the first prompt the hooks missed. Found while comparing the
+  two: the transcript records a hook-denied call as a failed execution, so
+  the offline side said "failed" where the live log said "blocked". Fixed:
+  a failure whose error starts "Denied by preToolUse hook" is now read as
+  declined.

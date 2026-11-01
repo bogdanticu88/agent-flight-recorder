@@ -465,7 +465,13 @@ func parseCopilotCLI(s Source, c *pctx) error {
 			if txt == "" {
 				txt = errTxt
 			}
-			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "toolCallId"), Text: txt, Status: NormStatus(d["success"]), Error: errTxt}, nil, r)
+			st := NormStatus(d["success"])
+			// a call refused by a preToolUse hook is recorded as a failed
+			// execution; it never ran, so report it as rejected
+			if st == StatusError && strings.HasPrefix(strings.ToLower(strings.TrimSpace(errTxt)), "denied by pretooluse hook") {
+				st = StatusRejected
+			}
+			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "toolCallId"), Text: txt, Status: st, Error: errTxt}, nil, r)
 		case "subagent.started", "subagent.start":
 			c.emit(Event{TS: ts, Kind: KindOther, Text: "Subagent started: " + Str(d, "agentName", "name")}, nil, r)
 		case "hook.start", "hook.end":
