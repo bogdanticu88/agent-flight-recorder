@@ -53,7 +53,9 @@ func claudeSession(t *testing.T, home, sid, cwd string, ts time.Time, msgs ...ma
 func isolate(t *testing.T) (home string) {
 	t.Helper()
 	home = t.TempDir()
-	t.Setenv("AFR_LOG", filepath.Join(home, ".local", "state", "afr", "events.jsonl"))
+	// the collector ignores AFR_LOG, so the test log has to sit at the
+	// default location for this OS (LOCALAPPDATA on Windows)
+	t.Setenv("AFR_LOG", filepath.Join(userStateDir(RootsFor(home)), "events.jsonl"))
 	t.Setenv("AFR_POLICY", "")
 	md := t.TempDir()
 	old := machineDirOverride

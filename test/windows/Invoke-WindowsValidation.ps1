@@ -318,8 +318,11 @@ if ($SkipDeployScripts) {
         $r = Invoke-Script $PS51 $collectScript @("-ProfileDir", (Join-Path $U "fixtures\home\dev"), "-OutDir", (Join-Path $U "collections"), "-AfrPath", $Afr, "-Around", "2026-10-29T13:44:00Z", "-Margin", "1h", "-Case", "WINVAL") "deploy-collect"
         Compare-Result $phase "Invoke-AFRCollect.ps1 on fixture profile" "0" ([string]$r.ExitCode) ($r.StdOut + $r.StdErr)
         $b = ($r.StdOut -split "`r?`n" | Where-Object { $_ -like "BUNDLE: *" } | Select-Object -First 1)
-        if ($b) {
-            $v = Invoke-Native $Afr @("verify", $b.Substring(8)) "deploy-collect-verify"
+        # take the file from the output folder: the work root has non-ASCII in
+        # it, and the child's redirected stdout is not UTF-8 on every host
+        $zip = Get-ChildItem -LiteralPath (Join-Path $U "collections") -Filter "*.zip" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+        if ($b -and $zip) {
+            $v = Invoke-Native $Afr @("verify", $zip.FullName) "deploy-collect-verify"
             Compare-Result $phase "bundle from collection script verifies" "0" ([string]$v.ExitCode) $v.StdOut
         } else {
             Add-Result $phase "bundle from collection script verifies" "0" "no BUNDLE line" "FAIL" $r.StdOut

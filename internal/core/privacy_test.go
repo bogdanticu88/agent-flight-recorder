@@ -95,6 +95,9 @@ func TestOutOfWindowLiveContentIsNotExported(t *testing.T) {
 	mustNotContain(t, all, "unrelated private conversation")
 	mustNotContain(t, all, "another private matter")
 	mustContain(t, all, "fix the build")
+	if m.LiveLog == nil {
+		t.Fatal("live log not captured")
+	}
 	if m.LiveLog.Mode != "excerpt" || m.LiveLog.InWindow != 1 || m.LiveLog.Records != 3 {
 		t.Fatalf("live metadata: %+v", m.LiveLog)
 	}

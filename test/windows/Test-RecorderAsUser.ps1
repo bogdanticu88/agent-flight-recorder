@@ -57,6 +57,9 @@ function Invoke-Afr {
     [IO.File]::WriteAllText($in, $(if ($Stdin) { $Stdin } else { "" }), $utf8)
     $quoted = $ArgList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
     $p = Start-Process -FilePath $Afr -ArgumentList ($quoted -join " ") -RedirectStandardInput $in -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+    # Without -Wait, ExitCode stays empty unless the process handle is opened
+    # while the process is still running. Touch it now.
+    $null = $p.Handle
     if ($NoWait) { return [pscustomobject]@{ Process = $p; Out = $out; Err = $err } }
     $p.WaitForExit()
     [pscustomobject]@{
@@ -200,7 +203,12 @@ switch ($Mode) {
         Start-Sleep -Seconds 16   # longer than the 15 s stale-lock threshold
         $r = Invoke-Hook
         $got = if ($r.ExitCode -eq 0 -and $r.StdErr -notmatch "recording failed") { "recorded" } else { "failed" }
-        Compare-Result -Name "recording continues after killed writers" -Expected "recorded" -Actual $got -Details ("killed {0}; stderr: {1}" -f $killed, $r.StdErr)
+        if ($killed -eq 0) {
+            # every writer finished before the kill; termination was not exercised
+            Add-Result -Name "recording continues after killed writers" -Expected "recorded" -Actual "not exercised" -Status "SKIP" -Details "all writers exited before they could be killed"
+        } else {
+            Compare-Result -Name "recording continues after killed writers" -Expected "recorded" -Actual $got -Details ("killed {0}; stderr: {1}" -f $killed, $r.StdErr)
+        }
         $v = Get-Verify
         $state = if ($v.Status -eq "CONSISTENT") { "consistent" } elseif ($v.Status -eq "INVALID") { "invalid (torn record marked)" } else { $v.Status }
         Add-Result -Name "chain state after termination" -Expected "consistent, or invalid with a marked torn record" -Actual $state -Status $(if ($v.Status -in @("CONSISTENT", "INVALID")) { "PASS" } else { "FAIL" }) -Details $v.Raw

@@ -43,6 +43,8 @@ func main() {
 		}
 		fmt.Println("stub: install ok")
 	case "collect":
+		// afr prints progress on stderr even when it succeeds
+		fmt.Fprintln(os.Stderr, "stub: collecting")
 		out := ""
 		for i := 2; i < len(os.Args)-1; i++ {
 			if os.Args[i] == "-o" {

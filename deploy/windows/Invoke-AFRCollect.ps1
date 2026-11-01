@@ -85,7 +85,9 @@ foreach ($profileDir in $profiles) {
     if (-not (Test-Path $profileDir)) { Write-Warning "profile not found: $profileDir"; $exitCode = 1; continue }
     $name = Split-Path $profileDir -Leaf
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
-    $bundle = Join-Path $outDir "afr-$env:COMPUTERNAME-$name-$stamp.zip"
+    # ASCII-only file name, so the BUNDLE line survives any console code page
+    $safe = ("afr-$env:COMPUTERNAME-$name-$stamp" -replace '[^A-Za-z0-9._-]', '_')
+    $bundle = Join-Path $outDir "$safe.zip"
     $afrArgs = @("collect", "--home", $profileDir, "--mode", "soc", "-o", $bundle)
     if ($Around) { $afrArgs += @("--around", $Around, "--margin", $Margin) }
     elseif ($Last) { $afrArgs += @("--last", $Last) }
@@ -93,8 +95,20 @@ foreach ($profileDir in $profiles) {
     if ($IncludeRaw) { $afrArgs += "--include-raw" }
 
     Write-Output "== collecting $profileDir"
-    & $afr @afrArgs 2>&1 | ForEach-Object { Write-Output "   $_" }
-    $code = $LASTEXITCODE
+    # afr writes progress to stderr. Under "Stop", Windows PowerShell 5.1 turns
+    # the first stderr line of a native command into a terminating error, so
+    # relax it for this call only. afr writes UTF-8; decode it as such.
+    $savedEap = $ErrorActionPreference
+    $savedEnc = $null
+    try { $savedEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $savedEnc = $null }
+    try {
+        $ErrorActionPreference = "Continue"
+        & $afr @afrArgs 2>&1 | ForEach-Object { Write-Output ("   " + [string]$_) }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedEap
+        if ($savedEnc) { try { [Console]::OutputEncoding = $savedEnc } catch {} }
+    }
     # afr exit codes: 0 complete, 3 partial (bundle written, some sources failed), anything else failed
     if ($code -ne 0 -and $code -ne 3) {
         Write-Output "FAILED: collection of $profileDir exited with $code; no usable bundle"

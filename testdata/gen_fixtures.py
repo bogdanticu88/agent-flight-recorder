@@ -16,6 +16,10 @@ import os
 import sqlite3
 import sys
 
+# Windows consoles and redirected pipes default to a legacy code page
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 out = os.path.abspath(sys.argv[1])
 H = os.path.join(out, "home", "dev")
 REPO = os.path.join(out, "src", "acme-sdk")
