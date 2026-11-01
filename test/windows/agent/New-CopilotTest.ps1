@@ -26,11 +26,13 @@
 [CmdletBinding()]
 param(
     [string]$Root = "C:\afr-copilot-test",
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path,
+    [string]$RepoRoot,
     [switch]$WithInjection
 )
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults
+if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path }
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 function Write-Text([string]$Path, [string]$Text) {
     New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
