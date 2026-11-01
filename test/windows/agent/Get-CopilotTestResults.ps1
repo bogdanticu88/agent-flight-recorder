@@ -69,6 +69,35 @@ if ($match) {
     Write-Output "== no VS Code workspaceStorage folder found for $ws (offline side will be empty)"
 }
 
+# Copilot-target sessions (VS Code and Copilot CLI) are kept under
+# ~/.copilot/session-state/<session id>. Copy only the sessions whose IDs the
+# test's own live log recorded, and only their transcript and workspace file.
+$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME ".copilot" }
+$ids = @()
+if (Test-Path -LiteralPath $log) {
+    $ids = @(Get-Content -LiteralPath $log | ForEach-Object { try { ($_ | ConvertFrom-Json).session_id } catch {} } |
+            Where-Object { $_ -match '^[0-9a-fA-F-]{8,}$' } | Sort-Object -Unique)
+}
+foreach ($id in $ids) {
+    $src = Join-Path $copilotHome "session-state\$id"
+    if (-not (Test-Path -LiteralPath $src)) { continue }
+    $dst = Join-Path $fake ".copilot\session-state\$id"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    foreach ($f in @("events.jsonl", "workspace.yaml")) {
+        $from = Join-Path $src $f
+        if (-not (Test-Path -LiteralPath $from)) { continue }
+        try {
+            # open with read sharing: the session may still be open in VS Code
+            $in = [IO.File]::Open($from, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try {
+                $outf = [IO.File]::Create((Join-Path $dst $f))
+                try { $in.CopyTo($outf) } finally { $outf.Close() }
+            } finally { $in.Close() }
+        } catch { Write-Output "   could not copy $from : $($_.Exception.Message)" }
+    }
+    Write-Output "== copied Copilot session-state for $id"
+}
+
 $bundle = Join-Path $out "copilot-test.zip"
 Remove-Item -LiteralPath $bundle, "$bundle.sha256" -ErrorAction SilentlyContinue
 Run "collect (stand-in profile + live log)" @("collect", "--home", $fake, "--live-log", $log, "--full-live-log", "--last", "48h", "--workspace", $ws, "-o", $bundle)

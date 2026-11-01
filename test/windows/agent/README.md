@@ -15,7 +15,10 @@ not touched. To undo everything, close the VS Code window and delete
 
 Results collection reads VS Code's `workspaceStorage\*\workspace.json`
 metadata to find the one folder that belongs to the test workspace and copies
-only that folder. No other transcripts are read or collected.
+only that folder. It also copies `~\.copilot\session-state\<id>\events.jsonl`
+and `workspace.yaml` for the session IDs found in the test's own live log, which
+is where Copilot-target sessions are kept. No other transcripts are read or
+collected.
 
 ## Steps
 
