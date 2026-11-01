@@ -125,4 +125,5 @@ Open:
   two: the transcript records a hook-denied call as a failed execution, so
   the offline side said "failed" where the live log said "blocked". Fixed:
   a failure whose error starts "Denied by preToolUse hook" is now read as
-  declined.
+  declined. Confirmed on the same host with d216543: both streams now report
+  the credentials read as blocked.
