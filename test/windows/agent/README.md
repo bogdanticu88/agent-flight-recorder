@@ -59,3 +59,29 @@ prints.
   work, that is a likely cause and nothing in this folder can override it.
 - Open **Output** and select the Copilot or GitHub Copilot Chat channel to
   look for hook errors.
+
+# Real-agent test: Codex CLI and Gemini CLI
+
+Same idea, but the isolation comes from the agents' own home-directory
+variables instead of a workspace file: `CODEX_HOME` and `GEMINI_CLI_HOME`
+point the CLI at a stand-in home under `C:\afr-<agent>-test\profile`, and
+afr's hooks are written there by `afr install`, the same code a real
+deployment runs. Your real `~\.codex` and `~\.gemini` are not read or
+written. You sign in to the agent again inside the stand-in home; the
+tokens go when you delete the test folder.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\agent\New-AgentTest.ps1 -Agent codex -WithInjection
+# then, in a new PowerShell window, the three lines it prints
+```
+
+Codex asks you to review and trust new hooks before they run: type `/hooks`
+and trust the afr entries. Gemini CLI lists hooks under `/hooks panel`.
+Use the same four prompts as the Copilot test, then:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\agent\Get-AgentTestResults.ps1 -Agent codex
+```
+
+Replace `codex` with `gemini-cli` for Gemini. Delete `C:\afr-codex-test` or
+`C:\afr-gemini-cli-test` to undo everything.
