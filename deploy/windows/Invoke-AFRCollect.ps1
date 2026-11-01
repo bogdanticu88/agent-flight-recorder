@@ -103,7 +103,11 @@ foreach ($profileDir in $profiles) {
     try { $savedEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $savedEnc = $null }
     try {
         $ErrorActionPreference = "Continue"
-        & $afr @afrArgs 2>&1 | ForEach-Object { Write-Output ("   " + [string]$_) }
+        & $afr @afrArgs 2>&1 | ForEach-Object {
+            # stderr lines arrive as ErrorRecords; an empty one would print its type name
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ }
+            Write-Output ("   " + $line)
+        }
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedEap

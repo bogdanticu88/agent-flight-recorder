@@ -48,24 +48,46 @@ function Compare-Result {
 
 # Runs afr with arguments and an optional UTF-8 stdin payload, without the
 # console re-encoding the payload (Windows PowerShell 5.1 pipes in ASCII).
+# Uses System.Diagnostics.Process directly: a process object returned by
+# Start-Process -PassThru (without -Wait) loses its exit code when the child
+# exits before PowerShell opens its handle, which happens with short runs.
 function Invoke-Afr {
-    param([string[]]$ArgList, [string]$Stdin = $null, [switch]$NoWait)
-    $id = [guid]::NewGuid().ToString("N")
-    $in = Join-Path $ScratchDir "$id.in"
-    $out = Join-Path $ScratchDir "$id.out"
-    $err = Join-Path $ScratchDir "$id.err"
-    [IO.File]::WriteAllText($in, $(if ($Stdin) { $Stdin } else { "" }), $utf8)
+    param([string[]]$ArgList, [string]$Stdin = $null, [switch]$NoWait, [switch]$KillAtOnce)
     $quoted = $ArgList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
-    $p = Start-Process -FilePath $Afr -ArgumentList ($quoted -join " ") -RedirectStandardInput $in -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
-    # Without -Wait, ExitCode stays empty unless the process handle is opened
-    # while the process is still running. Touch it now.
-    $null = $p.Handle
-    if ($NoWait) { return [pscustomobject]@{ Process = $p; Out = $out; Err = $err } }
-    $p.WaitForExit()
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Afr
+    $psi.Arguments = ($quoted -join " ")
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
+    $p = [Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $killed = $false
+    if ($KillAtOnce) {
+        try { $p.Kill(); $killed = $true } catch {}
+    }
+    try {
+        if ($Stdin) { $b = $utf8.GetBytes($Stdin); $p.StandardInput.BaseStream.Write($b, 0, $b.Length) }
+        $p.StandardInput.Close()
+    } catch {}
+    $h = [pscustomobject]@{ Process = $p; OutTask = $outTask; ErrTask = $errTask; Killed = $killed }
+    if ($NoWait) { return $h }
+    Complete-Afr $h
+}
+
+function Complete-Afr {
+    param($H)
+    $H.Process.WaitForExit()
     [pscustomobject]@{
-        ExitCode = $p.ExitCode
-        StdOut   = (Get-Content -Raw -ErrorAction SilentlyContinue $out)
-        StdErr   = (Get-Content -Raw -ErrorAction SilentlyContinue $err)
+        ExitCode = $H.Process.ExitCode
+        StdOut   = $H.OutTask.Result
+        StdErr   = $H.ErrTask.Result
+        Killed   = $H.Killed
     }
 }
 
@@ -83,10 +105,10 @@ function New-Payload {
 }
 
 function Invoke-Hook {
-    param([string]$Event = "PreToolUse", [switch]$NoWait)
+    param([string]$Event = "PreToolUse", [switch]$NoWait, [switch]$KillAtOnce)
     $env:AFR_LOG = $LogPath
     $env:AFR_POLICY = ""
-    Invoke-Afr -ArgList @("hook", "--agent", "claude-code", "--event", $Event) -Stdin (New-Payload -Event $Event) -NoWait:$NoWait
+    Invoke-Afr -ArgList @("hook", "--agent", "claude-code", "--event", $Event) -Stdin (New-Payload -Event $Event) -NoWait:$NoWait -KillAtOnce:$KillAtOnce
 }
 
 function Get-Verify {
@@ -168,8 +190,8 @@ switch ($Mode) {
         # 4. concurrent recording
         $procs = @()
         for ($i = 0; $i -lt $Concurrency; $i++) { $procs += Invoke-Hook -NoWait }
-        $procs | ForEach-Object { $_.Process.WaitForExit() }
-        $failed = @($procs | Where-Object { $_.Process.ExitCode -ne 0 -or ((Get-Content -Raw -ErrorAction SilentlyContinue $_.Err) -match "recording failed") }).Count
+        $done = @($procs | ForEach-Object { Complete-Afr $_ })
+        $failed = @($done | Where-Object { $_.ExitCode -ne 0 -or $_.StdErr -match "recording failed" }).Count
         $v = Get-Verify
         Compare-Result -Name "concurrent appends ($Concurrency)" -Expected ("0 failed, CONSISTENT/{0}" -f (3 + $Concurrency)) -Actual ("{0} failed, {1}/{2}" -f $failed, $v.Status, $v.Records) -Details $v.Raw
         $base = $v.Records
@@ -188,18 +210,16 @@ switch ($Mode) {
         (Get-Item -LiteralPath $lock).LastWriteTime = (Get-Date).AddMinutes(-2)
         $r = Invoke-Hook
         $got = if ($r.ExitCode -eq 0 -and $r.StdErr -notmatch "recording failed") { "recorded" } else { "failed" }
-        Compare-Result -Name "stale lock recovered" -Expected "recorded" -Actual $got -Details $r.StdErr
+        Compare-Result -Name "stale lock recovered" -Expected "recorded" -Actual $got -Details ("exit {0}; stderr: {1}" -f $r.ExitCode, $r.StdErr)
         Compare-Result -Name "stale lock removed afterwards" -Expected "False" -Actual ([string](Test-Path -LiteralPath $lock))
 
         # 7. termination: kill writers mid-flight, then confirm recording continues
+        # every other writer is killed straight after it starts, while it is
+        # still initialising, reading the payload or holding the lock
         $procs = @()
-        for ($i = 0; $i -lt $Concurrency; $i++) { $procs += Invoke-Hook -NoWait }
-        Start-Sleep -Milliseconds 30
-        $killed = 0
-        foreach ($p in ($procs | Select-Object -First ([math]::Floor($Concurrency / 2)))) {
-            try { if (-not $p.Process.HasExited) { $p.Process.Kill(); $killed++ } } catch {}
-        }
-        $procs | ForEach-Object { try { $_.Process.WaitForExit() } catch {} }
+        for ($i = 0; $i -lt $Concurrency; $i++) { $procs += Invoke-Hook -NoWait -KillAtOnce:($i % 2 -eq 0) }
+        $done = @($procs | ForEach-Object { try { Complete-Afr $_ } catch {} })
+        $killed = @($done | Where-Object { $_.Killed }).Count
         Start-Sleep -Seconds 16   # longer than the 15 s stale-lock threshold
         $r = Invoke-Hook
         $got = if ($r.ExitCode -eq 0 -and $r.StdErr -notmatch "recording failed") { "recorded" } else { "failed" }
@@ -227,7 +247,7 @@ switch ($Mode) {
         $r = Invoke-Hook
         $got = if ($r.ExitCode -eq 0 -and $r.StdErr -notmatch "recording failed") { "allowed" } else { "denied" }
         # documented gap: the expected (current) behaviour is that this succeeds
-        Add-Result -Name "pre-create another user's log name" -Expected "allowed (documented gap)" -Actual $got -Status $(if ($got -eq "allowed") { "GAP" } else { "PASS" }) -Details $r.StdErr
+        Add-Result -Name "pre-create another user's log name" -Expected "allowed (documented gap)" -Actual $got -Status $(if ($got -eq "allowed") { "GAP" } else { "PASS" }) -Details ("exit {0}; stderr: {1}" -f $r.ExitCode, $r.StdErr)
     }
 
     "victim" {
