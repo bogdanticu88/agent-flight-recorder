@@ -362,7 +362,10 @@ func Collect(o CollectOptions) (string, *Manifest, error) {
 					bw.putFile("raw/"+rawName(f.Path), filepath.Join(dst, filepath.Base(f.Path)))
 				}
 			default:
-				bw.putFile("raw/"+rawName(real), s.snapshot)
+				// named after the path recorded in sources.json, not the
+				// resolved one, so the two can be matched (they differ under
+				// /var on macOS and with 8.3 short names on Windows)
+				bw.putFile("raw/"+rawName(s.Path), s.snapshot)
 			}
 		}
 	}
