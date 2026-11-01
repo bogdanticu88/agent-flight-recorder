@@ -75,14 +75,16 @@ $ErrorActionPreference = "Stop"
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or $identity.IsSystem
 $mode = if ($elevated) { "soc" } else { "user" }
+# plain message and exit 1, without a PowerShell stack dump for the end user
+function Stop-Collect([string]$Message) { [Console]::Error.WriteLine("afr: $Message"); exit 1 }
 if (-not $OutDir) {
     $OutDir = if ($elevated) { Join-Path $env:ProgramData "AgentFlightRecorder\collections" } else { [Environment]::GetFolderPath("Desktop") }
 }
 if (-not $elevated) {
-    if ($IncludeRaw) { throw "-IncludeRaw is for SOC collections run as administrator or SYSTEM." }
+    if ($IncludeRaw) { Stop-Collect "-IncludeRaw is for SOC collections run as administrator or SYSTEM." }
     $own = $env:USERPROFILE
     if ($User -and $User -ne (Split-Path $own -Leaf)) {
-        throw "Collecting another user's profile ($User) needs administrator rights. Run without -User to collect your own."
+        Stop-Collect "Collecting another user's profile ($User) needs administrator rights. Run without -User to collect your own."
     }
     if (-not $ProfileDir) { $ProfileDir = $own }
 }

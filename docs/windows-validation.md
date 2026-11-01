@@ -2,6 +2,22 @@
 
 What has actually been run on a Windows host, and what that does not cover.
 
+## Run 4 (commit b487bd8), 1 November 2026
+
+Same host and setup as run 3. Result: 98 pass, 0 fail, 1 skip (race), the
+same 2 documented gaps. New in this run, executed as the standard user
+`afrval1` with no administrator rights:
+
+- `Invoke-AFRCollect.ps1 -Last 24h` exits 0, writes the bundle and its
+  sidecar to that user's Desktop, and the bundle verifies.
+- The manifest says `mode: user` and names the collecting user.
+- `-User afrval2` and `-IncludeRaw` are both refused with a non-zero exit.
+
+Not shown by run 4: that profile held no agent data, so the unelevated run
+found nothing to collect. Collection of real artifacts was only exercised
+elevated. The suite after b487bd8 seeds the synthetic sessions into the test
+profile first and checks that the unelevated run finds all 48 steps.
+
 ## Run 3 (commit a858da2), 1 November 2026
 
 Host: Windows 11 Pro 10.0.26300, workgroup machine (not Entra or domain

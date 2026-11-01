@@ -431,7 +431,18 @@ if ($SkipAccounts) {
         $cname = "${UserPrefix}1"
         $cscratch = Join-Path $WorkRoot "users\$cname"
         $cout = Join-Path $Ev "user-$cname-collect.out.txt"
-        $argString = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $userCollect, "-AfrPath", $Afr, "-Last", "24h") | ForEach-Object { ConvertTo-Arg $_ }) -join " "
+        # seed the test user's profile with the synthetic agent sessions, so the
+        # unelevated run has real artifacts to find (the profile exists once
+        # the account has logged on through the recorder tests above)
+        $cprofile = Join-Path $env:SystemDrive "Users\$cname"
+        $fixtureHome = Join-Path $U "fixtures\home\dev"
+        $seeded = $false
+        if ((Test-Path -LiteralPath $fixtureHome) -and (Test-Path -LiteralPath $cprofile)) {
+            Get-ChildItem -LiteralPath $fixtureHome -Force | Copy-Item -Destination $cprofile -Recurse -Force
+            $seeded = $true
+        }
+        $window = if ($seeded) { @("-Around", "2026-10-29T13:44:00Z", "-Margin", "1h") } else { @("-Last", "24h") }
+        $argString = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $userCollect, "-AfrPath", $Afr) + $window | ForEach-Object { ConvertTo-Arg $_ }) -join " "
         $p = Start-Process -FilePath $PS51 -ArgumentList $argString -Credential $creds[$cname] -LoadUserProfile -WorkingDirectory $cscratch `
             -RedirectStandardOutput $cout -RedirectStandardError (Join-Path $Ev "user-$cname-collect.err.txt") -Wait -PassThru
         Compare-Result "collect-user" "standard user runs Invoke-AFRCollect.ps1 on own profile" "0" ([string]$p.ExitCode) (Get-Content -Raw -ErrorAction SilentlyContinue $cout)
@@ -453,6 +464,11 @@ if ($SkipAccounts) {
                 $sr.Close()
             } finally { $za.Dispose() }
             Compare-Result "collect-user" "bundle is labelled user mode" "user" ([string]$man.mode) ""
+            if ($seeded) {
+                Compare-Result "collect-user" "user-mode run finds the seeded agent sessions" "48" ([string]$man.events_in_window) "fixture collection as administrator found 48"
+            } else {
+                Add-Result "collect-user" "user-mode run finds the seeded agent sessions" "48" "not seeded" "SKIP" "fixtures or the test profile were missing"
+            }
             Compare-Result "collect-user" "bundle records the collecting user" "True" ([string]($man.user -like "*\$cname")) ([string]$man.user)
         }
         # and the things a standard user must not be able to do with it
