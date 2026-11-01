@@ -14,15 +14,25 @@
         getfile "C:\ProgramData\AgentFlightRecorder\collections\<bundle>.zip"
         getfile "C:\ProgramData\AgentFlightRecorder\collections\<bundle>.zip.sha256"
 
-    Can also be run by a user or admin directly in PowerShell.
+    Without administrator rights (the usual case when the script is sent to the
+    person whose machine is being looked at), it collects only the current
+    user's own profile, in user mode, and writes the bundle to their Desktop:
+
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-AFRCollect.ps1 -Last 24h
+
+    The user then sends back the .zip and its .zip.sha256. If machine policy
+    blocks scripts altogether, running afr.exe directly does the same job:
+
+        .\afr.exe collect --last 24h
 
     Exit code: 0 all bundles complete, 3 at least one partial bundle,
     1 any collection failed. BUNDLE lines are printed only for bundles whose
     hash matches their sidecar.
 
 .PARAMETER User
-    Profile folder name under C:\Users. Default: the user owning explorer.exe
-    (the interactive user), or every profile if none is logged on.
+    Profile folder name under C:\Users. Elevated, the default is the user owning
+    explorer.exe (the interactive user), or every profile if none is logged on.
+    Not elevated, only the current user's own profile can be collected.
 .PARAMETER Around
     Alert time (ISO 8601, UTC with Z). The window is -Margin either side.
 .PARAMETER Margin
@@ -32,12 +42,15 @@
 .PARAMETER Case
     Ticket or incident number, stamped into the manifest.
 .PARAMETER IncludeRaw
-    Also copy raw unredacted source files. SOC only; the bundle will contain secrets.
+    Also copy raw unredacted source files. Elevated (SOC) runs only; the bundle
+    will contain secrets.
 .PARAMETER ProfileDir
     Collect this profile folder directly instead of resolving -User under
     <SystemDrive>\Users (testing, or profiles stored elsewhere).
 .PARAMETER OutDir
-    Where bundles are written. Default: ProgramData\AgentFlightRecorder\collections.
+    Where bundles are written. Default when elevated:
+    ProgramData\AgentFlightRecorder\collections. Default otherwise: the
+    current user's Desktop.
 .PARAMETER AfrPath
     Use this afr.exe instead of searching the default locations.
 #>
@@ -50,11 +63,29 @@ param(
     [string]$Case,
     [switch]$IncludeRaw,
     [string]$ProfileDir,
-    [string]$OutDir = (Join-Path $env:ProgramData "AgentFlightRecorder\collections"),
+    [string]$OutDir,
     [string]$AfrPath
 )
 
 $ErrorActionPreference = "Stop"
+
+# Administrators and SYSTEM collect in SOC mode and may examine any profile.
+# Everyone else collects their own profile in user mode, so a bundle sent
+# back by the person under review is labelled as lower assurance.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or $identity.IsSystem
+$mode = if ($elevated) { "soc" } else { "user" }
+if (-not $OutDir) {
+    $OutDir = if ($elevated) { Join-Path $env:ProgramData "AgentFlightRecorder\collections" } else { [Environment]::GetFolderPath("Desktop") }
+}
+if (-not $elevated) {
+    if ($IncludeRaw) { throw "-IncludeRaw is for SOC collections run as administrator or SYSTEM." }
+    $own = $env:USERPROFILE
+    if ($User -and $User -ne (Split-Path $own -Leaf)) {
+        throw "Collecting another user's profile ($User) needs administrator rights. Run without -User to collect your own."
+    }
+    if (-not $ProfileDir) { $ProfileDir = $own }
+}
 
 $candidates = @(
     "$env:ProgramFiles\AgentFlightRecorder\afr.exe",
@@ -88,7 +119,7 @@ foreach ($profileDir in $profiles) {
     # ASCII-only file name, so the BUNDLE line survives any console code page
     $safe = ("afr-$env:COMPUTERNAME-$name-$stamp" -replace '[^A-Za-z0-9._-]', '_')
     $bundle = Join-Path $outDir "$safe.zip"
-    $afrArgs = @("collect", "--home", $profileDir, "--mode", "soc", "-o", $bundle)
+    $afrArgs = @("collect", "--home", $profileDir, "--mode", $mode, "-o", $bundle)
     if ($Around) { $afrArgs += @("--around", $Around, "--margin", $Margin) }
     elseif ($Last) { $afrArgs += @("--last", $Last) }
     if ($Case) { $afrArgs += @("--case", $Case) }
@@ -138,5 +169,8 @@ foreach ($profileDir in $profiles) {
     }
     Write-Output "BUNDLE: $bundle"
     Write-Output "SHA256: $hash"
+    if (-not $elevated) {
+        Write-Output "Send both files to your security team: $(Split-Path $bundle -Leaf) and $(Split-Path $sidecar -Leaf)"
+    }
 }
 exit $exitCode

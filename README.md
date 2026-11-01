@@ -108,7 +108,13 @@ sequenceDiagram
 
 **Mounted images.** Use `--root /mnt/image --home 'C:\Users\jdoe' --source-host LAPTOP-7`. The home path and every `cwd` recorded in transcripts are mapped into the image: drive-letter paths become `root/Users/...` and POSIX paths become `root/home/...`. Paths that can't be mapped safely (relative paths, UNC) are skipped and listed, never resolved against the analysis machine's own filesystem.
 
-**User mode** works the same way: the user runs `afr collect --around <time>` and sends back the zip. The manifest marks it as user-collected and lower assurance, because the person running it is part of the events under review.
+**User mode** needs no administrator rights. Send the user `afr.exe` and `Invoke-AFRCollect.ps1` and have them run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-AFRCollect.ps1 -Around 2026-10-29T13:40:00Z
+```
+
+Without elevation the script collects only the current user's own profile, in user mode, writes the bundle and its `.sha256` to their Desktop, and tells them which two files to send back. It refuses `-User` for anyone else and refuses `-IncludeRaw`. If machine policy blocks scripts outright, `afr.exe collect --around <time>` does the same job with the bundle in the current folder. The manifest marks the bundle as user-collected and lower assurance, because the person running it is part of the events under review. Application control (AppLocker, WDAC) may still block an unsigned `afr.exe`; that is outside what the script can change.
 
 ## Verifying evidence
 

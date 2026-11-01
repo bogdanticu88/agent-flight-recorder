@@ -424,6 +424,47 @@ if ($SkipAccounts) {
         Invoke-AsUser "${UserPrefix}1" "own" $ownLog
         Invoke-AsUser "${UserPrefix}2" "other" $ownLog
 
+        # the collection script as the person under review would run it: no
+        # admin rights, no arguments beyond the window
+        $userCollect = Join-Path $WorkRoot "scripts\Invoke-AFRCollect.ps1"
+        Copy-Item -LiteralPath (Join-Path $RepoRoot "deploy\windows\Invoke-AFRCollect.ps1") -Destination $userCollect -Force
+        $cname = "${UserPrefix}1"
+        $cscratch = Join-Path $WorkRoot "users\$cname"
+        $cout = Join-Path $Ev "user-$cname-collect.out.txt"
+        $argString = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $userCollect, "-AfrPath", $Afr, "-Last", "24h") | ForEach-Object { ConvertTo-Arg $_ }) -join " "
+        $p = Start-Process -FilePath $PS51 -ArgumentList $argString -Credential $creds[$cname] -LoadUserProfile -WorkingDirectory $cscratch `
+            -RedirectStandardOutput $cout -RedirectStandardError (Join-Path $Ev "user-$cname-collect.err.txt") -Wait -PassThru
+        Compare-Result "collect-user" "standard user runs Invoke-AFRCollect.ps1 on own profile" "0" ([string]$p.ExitCode) (Get-Content -Raw -ErrorAction SilentlyContinue $cout)
+        $desk = Join-Path $env:SystemDrive "Users\$cname\Desktop"
+        $zip = Get-ChildItem -LiteralPath $desk -Filter "afr-*.zip" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        Compare-Result "collect-user" "bundle written to the user's Desktop" "True" ([string]([bool]$zip)) $desk
+        if ($zip) {
+            # keep a copy: the test profile goes when the account is removed
+            Copy-Item -LiteralPath $zip.FullName, ($zip.FullName + ".sha256") -Destination $Ev -ErrorAction SilentlyContinue
+            Compare-Result "collect-user" "sidecar written next to it" "True" ([string](Test-Path -LiteralPath ($zip.FullName + ".sha256"))) ""
+            $v = Invoke-Native $Afr @("verify", $zip.FullName) "user-collect-verify"
+            Compare-Result "collect-user" "user bundle verifies" "0" ([string]$v.ExitCode) $v.StdOut
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $za = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
+            try {
+                $me = $za.Entries | Where-Object { $_.FullName -eq "manifest.json" } | Select-Object -First 1
+                $sr = New-Object IO.StreamReader($me.Open())
+                $man = $sr.ReadToEnd() | ConvertFrom-Json
+                $sr.Close()
+            } finally { $za.Dispose() }
+            Compare-Result "collect-user" "bundle is labelled user mode" "user" ([string]$man.mode) ""
+            Compare-Result "collect-user" "bundle records the collecting user" "True" ([string]($man.user -like "*\$cname")) ([string]$man.user)
+        }
+        # and the things a standard user must not be able to do with it
+        foreach ($bad in @(
+                @{ Name = "another user's profile is refused"; Args = @("-User", "${UserPrefix}2") },
+                @{ Name = "-IncludeRaw is refused"; Args = @("-IncludeRaw") })) {
+            $argString = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $userCollect, "-AfrPath", $Afr, "-Last", "24h") + $bad.Args | ForEach-Object { ConvertTo-Arg $_ }) -join " "
+            $p = Start-Process -FilePath $PS51 -ArgumentList $argString -Credential $creds[$cname] -LoadUserProfile -WorkingDirectory $cscratch `
+                -RedirectStandardOutput (Join-Path $Ev "user-$cname-collect-bad.out.txt") -RedirectStandardError (Join-Path $Ev "user-$cname-collect-bad.err.txt") -Wait -PassThru
+            Compare-Result "collect-user" $bad.Name "nonzero" $(if ($p.ExitCode -ne 0) { "nonzero" } else { "0" }) (Get-Content -Raw -ErrorAction SilentlyContinue (Join-Path $Ev "user-$cname-collect-bad.err.txt"))
+        }
+
         foreach ($name in $created) {
             $f = Join-Path $WorkRoot "users\$name\results.jsonl"
             if (Test-Path -LiteralPath $f) { [IO.File]::AppendAllText($Results, [IO.File]::ReadAllText($f, $utf8), $utf8) }
