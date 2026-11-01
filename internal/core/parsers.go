@@ -14,24 +14,42 @@ import (
 // pctx builds events for one source file, keeping order and inheriting a
 // timestamp when a step has none of its own.
 type pctx struct {
-	agent   string
-	source  string
-	session string
-	cwd     string
-	model   string
-	seq     int
-	lastTS  time.Time
-	fileTS  time.Time
-	events  []Event
+	agent     string
+	source    string
+	session   string
+	cwd       string
+	model     string
+	seq       int
+	lastTS    time.Time
+	fileTS    time.Time
+	events    []Event
+	malformed int      // records that could not be decoded
+	diags     []string // parse problems worth reporting (capped)
 }
 
-func newCtx(agent, path string) *pctx {
-	c := &pctx{agent: agent, source: path}
-	if st, err := os.Stat(path); err == nil {
-		c.fileTS = st.ModTime().UTC()
+func newCtx(s Source) *pctx {
+	c := &pctx{agent: s.Agent, source: s.Path}
+	if t, err := time.Parse(time.RFC3339, s.ModTime); err == nil {
+		c.fileTS = t.UTC()
 	}
 	return c
 }
+
+func (c *pctx) diag(format string, a ...any) {
+	if len(c.diags) < 50 {
+		c.diags = append(c.diags, fmt.Sprintf(format, a...))
+	}
+}
+
+// Limits for untrusted artifacts.
+const (
+	maxLineBytes   = 64 << 20  // one JSONL record
+	maxJSONBytes   = 512 << 20 // one JSON document
+	maxOpLogOps    = 1_000_000
+	maxOpLogIndex  = 1_000_000
+	maxDirFiles    = 200_000
+	maxTextOfDepth = 32
+)
 
 func (c *pctx) touch(v any) {
 	if ts, ok := ParseTime(v); ok {
@@ -74,9 +92,7 @@ func (c *pctx) emit(e Event, rawInput any, ref string) {
 	if rawInput != nil || text != "" {
 		e.Paths = ExtractPaths(Decode(rawInput), text)
 	}
-	if e.Kind == KindToolCall || e.Kind == KindToolResult {
-		e.Text = Truncate(e.Text, 20000)
-	}
+	e.Pos = c.seq
 	c.events = append(c.events, e)
 }
 
@@ -90,7 +106,12 @@ func tsOf(m map[string]any, keys ...string) time.Time {
 }
 
 // textOf flattens the many shapes "content" takes across providers.
-func textOf(v any) string {
+func textOf(v any) string { return textOfDepth(v, 0) }
+
+func textOfDepth(v any, depth int) string {
+	if depth > maxTextOfDepth {
+		return ""
+	}
 	switch t := v.(type) {
 	case nil:
 		return ""
@@ -99,7 +120,7 @@ func textOf(v any) string {
 	case []any:
 		var parts []string
 		for _, x := range t {
-			if s := textOf(x); s != "" {
+			if s := textOfDepth(x, depth+1); s != "" {
 				parts = append(parts, s)
 			}
 		}
@@ -107,7 +128,7 @@ func textOf(v any) string {
 	case map[string]any:
 		for _, k := range []string{"text", "value", "content", "output", "message", "thinking", "data", "result"} {
 			if x, ok := t[k]; ok {
-				if s := textOf(x); s != "" {
+				if s := textOfDepth(x, depth+1); s != "" {
 					return s
 				}
 			}
@@ -116,30 +137,47 @@ func textOf(v any) string {
 	return ""
 }
 
-func readJSONL(path string, fn func(line int, m map[string]any)) error {
+// readJSONL calls fn for each decodable object line. Lines that are not JSON
+// objects are counted and reported through c, never silently dropped.
+func readJSONL(path string, c *pctx, fn func(line int, m map[string]any)) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 256*1024*1024)
+	sc.Buffer(make([]byte, 64*1024), maxLineBytes)
 	n := 0
 	for sc.Scan() {
 		n++
 		b := sc.Bytes()
-		if len(b) == 0 {
+		if len(strings.TrimSpace(string(b))) == 0 {
 			continue
 		}
 		var m map[string]any
-		if json.Unmarshal(b, &m) == nil {
-			fn(n, m)
+		if err := json.Unmarshal(b, &m); err != nil {
+			if c != nil {
+				c.malformed++
+				c.diag("line %d: not a JSON object (%v)", n, err)
+			}
+			continue
 		}
+		fn(n, m)
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("stopped after line %d: %w", n, err)
+	}
+	return nil
 }
 
 func readJSON(path string) (any, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > maxJSONBytes {
+		return nil, fmt.Errorf("file is %d bytes, over the %d byte parse limit", st.Size(), maxJSONBytes)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -167,50 +205,57 @@ func isContextBlob(s string) bool {
 // ParseSource dispatches to the right parser. Every parser falls back to the
 // generic extractor when it recognises nothing, so an unknown format version
 // still yields something instead of silently returning zero.
-func ParseSource(s Source) ([]Event, string, error) {
-	var (
-		evs []Event
-		err error
-	)
-	switch s.Parser {
-	case "claude-code":
-		evs, err = parseClaudeCode(s)
-	case "codex":
-		evs, err = parseCodex(s)
-	case "copilot-cli":
-		evs, err = parseCopilotCLI(s)
-	case "vscode-chat":
-		evs, err = parseVSCodeChatFile(s)
-	case "vscode-statedb":
-		evs, err = parseVSCodeStateDB(s)
-	case "gemini":
-		evs, err = parseGemini(s)
-	case "cline":
-		evs, err = parseCline(s)
-	case "opencode-db":
-		evs, err = parseOpenCodeDB(s)
-	case "opencode-storage":
-		evs, err = parseOpenCodeStorage(s)
-	case "cursor-db":
-		evs, err = parseCursorDB(s)
-	case "logfile", "config":
-		return nil, "captured for evidence, not parsed into steps", nil
-	default:
-		return nil, "", fmt.Errorf("no parser %q", s.Parser)
+// ParseResult carries the events from one source plus everything the analyst
+// needs to judge how complete the parse was.
+type ParseResult struct {
+	Events    []Event
+	Note      string
+	Malformed int
+	Diags     []string
+	Generic   bool // the dedicated parser recognised nothing; generic extraction used
+}
+
+var parsers = map[string]func(Source, *pctx) error{
+	"claude-code":      parseClaudeCode,
+	"codex":            parseCodex,
+	"copilot-cli":      parseCopilotCLI,
+	"vscode-chat":      parseVSCodeChatFile,
+	"vscode-statedb":   parseVSCodeStateDB,
+	"gemini":           parseGemini,
+	"cline":            parseCline,
+	"opencode-db":      parseOpenCodeDB,
+	"opencode-storage": parseOpenCodeStorage,
+	"cursor-db":        parseCursorDB,
+}
+
+// ParseSource dispatches to the right parser. When a dedicated parser finds
+// nothing in a file it should understand, the generic extractor runs, so an
+// unknown format version still yields something; the result says so.
+func ParseSource(s Source) (ParseResult, error) {
+	if s.Parser == "logfile" || s.Parser == "config" {
+		return ParseResult{Note: "captured for evidence, not parsed into steps"}, nil
 	}
-	if err == nil && len(evs) == 0 && s.Parser != "vscode-statedb" && s.Parser != "cursor-db" && s.Parser != "opencode-db" {
-		if g, gerr := parseGeneric(s); gerr == nil && len(g) > 0 {
-			return g, "known parser found nothing, generic extractor used (format may have changed)", nil
+	fn, ok := parsers[s.Parser]
+	if !ok {
+		return ParseResult{}, fmt.Errorf("no parser %q", s.Parser)
+	}
+	c := newCtx(s)
+	err := fn(s, c)
+	res := ParseResult{Events: c.events, Malformed: c.malformed, Diags: c.diags}
+	if err == nil && len(c.events) == 0 && s.Parser != "vscode-statedb" && s.Parser != "cursor-db" && s.Parser != "opencode-db" && s.Parser != "opencode-storage" {
+		g := newCtx(s)
+		if gerr := parseGeneric(s, g); gerr == nil && len(g.events) > 0 {
+			res = ParseResult{Events: g.events, Malformed: g.malformed + c.malformed, Diags: append(c.diags, g.diags...), Generic: true,
+				Note: "dedicated parser found nothing; generic extractor used (format may have changed)"}
 		}
 	}
-	return evs, "", err
+	return res, err
 }
 
 // ---------------------------------------------------------------- Claude Code
 
-func parseClaudeCode(s Source) ([]Event, error) {
-	c := newCtx(s.Agent, s.Path)
-	err := readJSONL(s.Path, func(n int, m map[string]any) {
+func parseClaudeCode(s Source, c *pctx) error {
+	err := readJSONL(s.rp(), c, func(n int, m map[string]any) {
 		if sid := Str(m, "sessionId"); sid != "" {
 			c.session = sid
 		}
@@ -262,19 +307,22 @@ func parseClaudeCode(s Source) ([]Event, error) {
 					in := blk["input"]
 					c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(blk, "name"), CallID: Str(blk, "id"), Input: JSONString(in)}, in, ref(s.Path, n))
 				case "tool_result":
-					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(blk, "tool_use_id"), Text: textOf(blk["content"])}, nil, ref(s.Path, n))
+					st := StatusSuccess // Claude Code marks failures with is_error
+					if blk["is_error"] == true {
+						st = StatusError
+					}
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(blk, "tool_use_id"), Text: textOf(blk["content"]), Status: st}, nil, ref(s.Path, n))
 				}
 			}
 		}
 	})
-	return c.events, err
+	return err
 }
 
 // ---------------------------------------------------------------- OpenAI Codex
 
-func parseCodex(s Source) ([]Event, error) {
-	c := newCtx(s.Agent, s.Path)
-	err := readJSONL(s.Path, func(n int, m map[string]any) {
+func parseCodex(s Source, c *pctx) error {
+	err := readJSONL(s.rp(), c, func(n int, m map[string]any) {
 		ts := tsOf(m, "timestamp")
 		typ := Str(m, "type")
 		p, _ := m["payload"].(map[string]any)
@@ -308,7 +356,7 @@ func parseCodex(s Source) ([]Event, error) {
 			c.codexItem(p, ts, ref(s.Path, n))
 		}
 	})
-	return c.events, err
+	return err
 }
 
 func (c *pctx) codexItem(p map[string]any, ts time.Time, r string) {
@@ -344,11 +392,21 @@ func (c *pctx) codexItem(p map[string]any, ts time.Time, r string) {
 		c.emit(Event{TS: ts, Kind: KindToolCall, Tool: "local_shell", CallID: Str(p, "call_id", "id"), Input: JSONString(act)}, act, r)
 	case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
 		out := p["output"]
-		txt := textOf(Decode(out))
+		dec := Decode(out)
+		txt := textOf(dec)
 		if txt == "" {
 			txt = JSONString(out)
 		}
-		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(p, "call_id"), Text: txt}, nil, r)
+		st := ""
+		if dm, ok := dec.(map[string]any); ok {
+			if code, ok := Get(dm, "metadata.exit_code").(float64); ok {
+				st = StatusError
+				if code == 0 {
+					st = StatusSuccess
+				}
+			}
+		}
+		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(p, "call_id"), Text: txt, Status: st}, nil, r)
 	case "web_search_call":
 		c.emit(Event{TS: ts, Kind: KindToolCall, Tool: "web_search", Input: JSONString(p["action"])}, p["action"], r)
 	}
@@ -356,13 +414,12 @@ func (c *pctx) codexItem(p map[string]any, ts time.Time, r string) {
 
 // ---------------------------------------------------------------- GitHub Copilot CLI
 
-func parseCopilotCLI(s Source) ([]Event, error) {
-	c := newCtx(s.Agent, s.Path)
+func parseCopilotCLI(s Source, c *pctx) error {
 	c.session = filepath.Base(filepath.Dir(s.Path))
 	if strings.HasSuffix(s.Path, ".json") { // legacy history-session-state
-		return nil, nil
+		return nil
 	}
-	err := readJSONL(s.Path, func(n int, m map[string]any) {
+	err := readJSONL(s.rp(), c, func(n int, m map[string]any) {
 		ts := tsOf(m, "timestamp", "data.timestamp")
 		d, _ := m["data"].(map[string]any)
 		if d == nil {
@@ -404,27 +461,33 @@ func parseCopilotCLI(s Source) ([]Event, error) {
 			c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(d, "toolName", "name"), CallID: Str(d, "toolCallId"), Input: JSONString(in)}, in, r)
 		case "tool.execution_complete":
 			txt := textOf(d["result"])
+			errTxt := textOf(d["error"])
 			if txt == "" {
-				txt = textOf(d["error"])
+				txt = errTxt
 			}
-			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "toolCallId"), Text: txt}, nil, r)
+			st := NormStatus(d["success"])
+			// a call refused by a preToolUse hook is recorded as a failed
+			// execution; it never ran, so report it as rejected
+			if st == StatusError && strings.HasPrefix(strings.ToLower(strings.TrimSpace(errTxt)), "denied by pretooluse hook") {
+				st = StatusRejected
+			}
+			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "toolCallId"), Text: txt, Status: st, Error: errTxt}, nil, r)
 		case "subagent.started", "subagent.start":
 			c.emit(Event{TS: ts, Kind: KindOther, Text: "Subagent started: " + Str(d, "agentName", "name")}, nil, r)
 		case "hook.start", "hook.end":
 			c.emit(Event{TS: ts, Kind: KindOther, Text: "Hook " + Str(m, "type") + ": " + JSONString(d)}, nil, r)
 		}
 	})
-	return c.events, err
+	return err
 }
 
 // ---------------------------------------------------------------- Gemini CLI
 
-func parseGemini(s Source) ([]Event, error) {
-	v, err := readJSON(s.Path)
+func parseGemini(s Source, c *pctx) error {
+	v, err := readJSON(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c := newCtx(s.Agent, s.Path)
 	c.session = strings.TrimSuffix(filepath.Base(s.Path), ".json")
 	var msgs []any
 	switch t := v.(type) {
@@ -490,23 +553,22 @@ func parseGemini(s Source) ([]Event, error) {
 				res = Str(t, "resultDisplay")
 			}
 			if res != "" || t["status"] != nil {
-				c.emit(Event{TS: tts, Kind: KindToolResult, CallID: Str(t, "id"), Text: strings.TrimSpace(Str(t, "status") + "\n" + res)}, nil, r)
+				c.emit(Event{TS: tts, Kind: KindToolResult, CallID: Str(t, "id"), Text: res, Status: NormStatus(t["status"])}, nil, r)
 			}
 		}
 	}
-	return c.events, nil
+	return nil
 }
 
 func asSlice(v any) []any { s, _ := v.([]any); return s }
 
 // ---------------------------------------------------------------- Cline / Roo Code
 
-func parseCline(s Source) ([]Event, error) {
-	v, err := readJSON(s.Path)
+func parseCline(s Source, c *pctx) error {
+	v, err := readJSON(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c := newCtx(s.Agent, s.Path)
 	c.session = filepath.Base(filepath.Dir(s.Path))
 	for i, x := range asSlice(v) {
 		m, _ := x.(map[string]any)
@@ -539,89 +601,146 @@ func parseCline(s Source) ([]Event, error) {
 			// carries the full request incl. tool results; keep paths only via generic text
 		}
 	}
-	return c.events, nil
+	return nil
 }
 
 // ---------------------------------------------------------------- VS Code Copilot Chat
 
-func parseVSCodeChatFile(s Source) ([]Event, error) {
+func parseVSCodeChatFile(s Source, c *pctx) error {
 	var state any
 	if strings.HasSuffix(s.Path, ".jsonl") {
-		st, err := replayVSCodeOpLog(s.Path)
+		st, err := replayVSCodeOpLog(s.rp(), c)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		state = st
 	} else {
-		v, err := readJSON(s.Path)
+		v, err := readJSON(s.rp())
 		if err != nil {
-			return nil, err
+			return err
 		}
 		state = v
 	}
-	c := newCtx(s.Agent, s.Path)
 	c.session = strings.TrimSuffix(strings.TrimSuffix(filepath.Base(s.Path), ".jsonl"), ".json")
 	if m, ok := state.(map[string]any); ok {
 		c.vscodeSession(m, filepath.Base(s.Path))
 	}
-	return c.events, nil
+	return nil
 }
 
 // replayVSCodeOpLog rebuilds session state from the newer append-only format:
-// kind 0 = full snapshot, kind 1 = set value at key path, kind 2 = append/splice array.
-func replayVSCodeOpLog(path string) (any, error) {
+// kind 0 = full snapshot, kind 1 = set value at key path, kind 2 = append/splice
+// array. Operations are untrusted: invalid paths or indices are rejected and
+// reported instead of being applied.
+func replayVSCodeOpLog(path string, c *pctx) (any, error) {
 	var state any
-	err := readJSONL(path, func(_ int, m map[string]any) {
+	ops := 0
+	var stopErr error
+	err := readJSONL(path, c, func(n int, m map[string]any) {
+		if stopErr != nil {
+			return
+		}
+		ops++
+		if ops > maxOpLogOps {
+			stopErr = fmt.Errorf("more than %d operations; replay stopped at line %d", maxOpLogOps, n)
+			return
+		}
 		kind, _ := m["kind"].(float64)
 		keys, _ := m["k"].([]any)
+		var (
+			next any
+			err  error
+		)
 		switch int(kind) {
 		case 0:
-			state = m["v"]
+			next = m["v"]
 		case 1:
-			state = setPath(state, keys, m["v"], false, -1)
+			next, err = setPath(state, keys, m["v"], false, -1, 0)
 		case 2:
 			idx := -1
 			if i, ok := m["i"].(float64); ok {
+				if i < 0 || i != float64(int(i)) {
+					err = fmt.Errorf("invalid splice index %v", i)
+				}
 				idx = int(i)
 			}
-			state = setPath(state, keys, m["v"], true, idx)
+			if err == nil {
+				next, err = setPath(state, keys, m["v"], true, idx, 0)
+			}
+		default:
+			err = fmt.Errorf("unknown operation kind %v", m["kind"])
 		}
+		if err != nil {
+			c.malformed++
+			c.diag("op-log line %d: %v (operation skipped)", n, err)
+			return
+		}
+		state = next
 	})
+	if err == nil {
+		err = stopErr
+	}
 	return state, err
 }
 
-func setPath(root any, keys []any, val any, appendArr bool, idx int) any {
+// setPath applies one op-log operation and returns the new value, or an error
+// for indices that are negative, non-integral, or beyond the end of the array
+// (appending at len is allowed). Rejected operations leave root untouched.
+func setPath(root any, keys []any, val any, appendArr bool, idx int, depth int) (any, error) {
+	if depth > maxWalkDepth {
+		return nil, fmt.Errorf("key path deeper than %d", maxWalkDepth)
+	}
 	if len(keys) == 0 {
-		if appendArr {
-			arr, _ := root.([]any)
-			if idx >= 0 && idx <= len(arr) {
-				arr = arr[:idx]
-			}
-			if items, ok := val.([]any); ok {
-				return append(arr, items...)
-			}
-			return append(arr, val)
+		if !appendArr {
+			return val, nil
 		}
-		return val
+		arr, _ := root.([]any)
+		if idx >= 0 {
+			if idx > len(arr) {
+				return nil, fmt.Errorf("splice index %d beyond array length %d", idx, len(arr))
+			}
+			arr = arr[:idx:idx]
+		}
+		if items, ok := val.([]any); ok {
+			return append(arr, items...), nil
+		}
+		return append(arr, val), nil
 	}
 	switch k := keys[0].(type) {
 	case string:
 		m, _ := root.(map[string]any)
-		if m == nil {
-			m = map[string]any{}
+		cp := make(map[string]any, len(m)+1)
+		for kk, vv := range m {
+			cp[kk] = vv
 		}
-		m[k] = setPath(m[k], keys[1:], val, appendArr, idx)
-		return m
+		v, err := setPath(cp[k], keys[1:], val, appendArr, idx, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		cp[k] = v
+		return cp, nil
 	case float64:
 		arr, _ := root.([]any)
-		i := int(k)
-		for len(arr) <= i {
-			arr = append(arr, nil)
+		if k < 0 || k != float64(int(k)) || k > maxOpLogIndex {
+			return nil, fmt.Errorf("invalid array index %v", k)
 		}
-		arr[i] = setPath(arr[i], keys[1:], val, appendArr, idx)
-		return arr
+		i := int(k)
+		if i > len(arr) {
+			return nil, fmt.Errorf("array index %d beyond length %d", i, len(arr))
+		}
+		cp := make([]any, len(arr), len(arr)+1)
+		copy(cp, arr)
+		if i == len(cp) {
+			cp = append(cp, nil)
+		}
+		v, err := setPath(cp[i], keys[1:], val, appendArr, idx, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		cp[i] = v
+		return cp, nil
 	}
-	return root
+	return nil, fmt.Errorf("invalid key %v", keys[0])
 }
 
 func (c *pctx) vscodeSession(sess map[string]any, refBase string) {
@@ -664,10 +783,12 @@ func (c *pctx) vscodeSession(sess map[string]any, refBase string) {
 		meta, _ := Get(req, "result.metadata").(map[string]any)
 		results, _ := meta["toolCallResults"].(map[string]any)
 		invMsgs := map[string]string{}
+		invStatus := map[string]string{}
 		for _, part := range asSlice(req["response"]) {
 			pm, _ := part.(map[string]any)
 			if pm != nil && Str(pm, "kind") == "toolInvocationSerialized" {
 				invMsgs[Str(pm, "toolCallId")] = textOf(pm["pastTenseMessage"]) + " " + textOf(pm["invocationMessage"])
+				invStatus[Str(pm, "toolCallId")] = vscodeInvStatus(pm)
 			}
 		}
 		usedRounds := false
@@ -694,7 +815,9 @@ func (c *pctx) vscodeSession(sess map[string]any, refBase string) {
 				in := Decode(t["arguments"])
 				c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(t, "name"), CallID: id, Input: JSONString(t["arguments"]), Reason: strings.TrimSpace(invMsgs[id])}, in, r)
 				if res, ok := results[id]; ok {
-					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: id, Text: textOf(res)}, nil, r)
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: id, Text: textOf(res), Status: invStatus[id]}, nil, r)
+				} else if st := invStatus[id]; st == StatusRejected {
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: id, Status: st}, nil, r)
 				}
 			}
 		}
@@ -716,8 +839,8 @@ func (c *pctx) vscodeSession(sess map[string]any, refBase string) {
 				}
 				msgTxt := strings.TrimSpace(textOf(pm["pastTenseMessage"]) + " " + textOf(pm["invocationMessage"]))
 				c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(pm, "toolId"), CallID: Str(pm, "toolCallId"), Input: JSONString(in), Reason: msgTxt, Text: msgTxt}, map[string]any{"in": in, "msg": msgTxt, "uris": pm["resultDetails"]}, r)
-				if out := Get(pm, "resultDetails.output"); out != nil {
-					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(pm, "toolCallId"), Text: textOf(out)}, nil, r)
+				if out := Get(pm, "resultDetails.output"); out != nil || vscodeInvStatus(pm) != "" {
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(pm, "toolCallId"), Text: textOf(out), Status: vscodeInvStatus(pm)}, nil, r)
 				}
 			case "thinking":
 				if !usedRounds {
@@ -743,14 +866,14 @@ func (c *pctx) vscodeSession(sess map[string]any, refBase string) {
 
 // ---------------------------------------------------------------- OpenCode JSON storage
 
-func parseOpenCodeStorage(s Source) ([]Event, error) {
+func parseOpenCodeStorage(s Source, c *pctx) error {
 	type msgInfo struct {
 		id, session, role, model string
 		created                  time.Time
 	}
 	msgs := map[string]msgInfo{}
 	var order []msgInfo
-	files, _ := filepath.Glob(filepath.Join(s.Path, "message", "*", "*.json"))
+	files, _ := filepath.Glob(filepath.Join(s.rp(), "message", "*", "*.json"))
 	for _, f := range files {
 		v, err := readJSON(f)
 		m, _ := v.(map[string]any)
@@ -768,9 +891,8 @@ func parseOpenCodeStorage(s Source) ([]Event, error) {
 		}
 		return order[i].created.Before(order[j].created) || (order[i].created.Equal(order[j].created) && order[i].id < order[j].id)
 	})
-	c := newCtx(s.Agent, s.Path)
 	for _, mi := range order {
-		parts, _ := filepath.Glob(filepath.Join(s.Path, "part", mi.id, "*.json"))
+		parts, _ := filepath.Glob(filepath.Join(s.rp(), "part", filepath.Base(mi.id), "*.json"))
 		sort.Strings(parts)
 		c.session, c.model, c.lastTS = mi.session, mi.model, mi.created
 		for _, pf := range parts {
@@ -781,7 +903,7 @@ func parseOpenCodeStorage(s Source) ([]Event, error) {
 			}
 		}
 	}
-	return c.events, nil
+	return nil
 }
 
 // openCodePart handles both the current TS schema (part.type = text|tool|reasoning)
@@ -813,7 +935,7 @@ func (c *pctx) openCodePart(p map[string]any, role, r string) {
 		c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(p, "tool"), CallID: Str(p, "callID"), Input: JSONString(in), Reason: title}, in, r)
 		out := Str(st, "output", "error")
 		if out != "" || Str(st, "status") != "" {
-			c.emit(Event{TS: tsOf(st, "time.end"), Kind: KindToolResult, CallID: Str(p, "callID"), Text: strings.TrimSpace(Str(st, "status") + "\n" + out)}, nil, r)
+			c.emit(Event{TS: tsOf(st, "time.end"), Kind: KindToolResult, CallID: Str(p, "callID"), Text: out, Status: NormStatus(st["status"]), Error: Str(st, "error")}, nil, r)
 		}
 	case "tool_call":
 		d, _ := p["data"].(map[string]any)
@@ -821,8 +943,27 @@ func (c *pctx) openCodePart(p map[string]any, role, r string) {
 		c.emit(Event{TS: ts, Kind: KindToolCall, Tool: Str(d, "name"), CallID: Str(d, "id"), Input: JSONString(in)}, in, r)
 	case "tool_result":
 		d, _ := p["data"].(map[string]any)
-		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "tool_call_id"), Text: Str(d, "content")}, nil, r)
+		st := StatusSuccess
+		if d["is_error"] == true {
+			st = StatusError
+		}
+		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(d, "tool_call_id"), Text: Str(d, "content"), Status: st}, nil, r)
 	case "subtask", "agent":
 		c.emit(Event{TS: ts, Kind: KindOther, Text: "Subagent: " + Str(p, "agent", "name") + " " + Str(p, "prompt", "description")}, nil, r)
 	}
+}
+
+// vscodeInvStatus reads the completion flags VS Code keeps on a serialised
+// tool invocation. isComplete only says the tool finished; an explicit error
+// flag or a declined confirmation takes precedence.
+func vscodeInvStatus(pm map[string]any) string {
+	switch {
+	case pm["isConfirmed"] == false:
+		return StatusRejected
+	case Get(pm, "resultDetails.isError") == true:
+		return StatusError
+	case pm["isComplete"] == true:
+		return StatusSuccess
+	}
+	return ""
 }

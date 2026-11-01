@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -113,8 +114,8 @@ func Plan(o InstallOptions) ([]Planned, error) {
 	}
 
 	if o.want("claude-code") {
-		evs := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStop", "Stop", "SessionEnd", "PreCompact"}
-		cfg := map[string]any{"hooks": o.claudeStyle("claude-code", evs, map[string]bool{"PreToolUse": true, "PostToolUse": true}, map[string]any{"timeout": 10})}
+		evs := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStop", "Stop", "SessionEnd", "PreCompact"}
+		cfg := map[string]any{"hooks": o.claudeStyle("claude-code", evs, map[string]bool{"PreToolUse": true, "PostToolUse": true, "PostToolUseFailure": true}, map[string]any{"timeout": 10})}
 		p := filepath.Join(h, ".claude", "settings.json")
 		note := ""
 		if machine {
@@ -128,9 +129,9 @@ func Plan(o InstallOptions) ([]Planned, error) {
 		evs := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
 		cfg := map[string]any{"hooks": o.claudeStyle("codex", evs, map[string]bool{"PreToolUse": true, "PostToolUse": true}, map[string]any{"timeout": 10})}
 		p := filepath.Join(h, ".codex", "hooks.json")
-		note := "Hooks may need enabling in ~/.codex/config.toml ([features] codex_hooks = true) depending on Codex version. Check Windows support for your version. Non-managed hooks must be trusted once by the user."
+		note := "Hooks are on by default in current Codex releases. Non-managed hooks must be reviewed and trusted by the user (/hooks) before they run, and trust is tied to the hook's hash."
 		if machine {
-			note += " For machine scope use Codex managed configuration (requirements/managed config) to enforce these hooks."
+			note += " This installer only writes the user file. For enforced hooks use Codex managed hooks ([hooks] in requirements.toml with managed_dir / windows_managed_dir, allow_managed_hooks_only = true)."
 		}
 		out = append(out, Planned{Agent: "codex", Path: p, Content: j(cfg), Merge: true, Note: note})
 	}
@@ -157,7 +158,7 @@ func Plan(o InstallOptions) ([]Planned, error) {
 			p = machinePath(osn, `C:\ProgramData\gemini-cli\settings.json`, "/Library/Application Support/GeminiCli/settings.json", "/etc/gemini-cli/settings.json")
 		}
 		out = append(out, Planned{Agent: "gemini-cli", Path: p, Content: j(map[string]any{"hooks": hooks}), Merge: true,
-			Note: "Hooks are experimental in some Gemini CLI versions and may need an enable flag in settings.json."})
+			Note: "Hook timeouts are in milliseconds. Some Gemini CLI versions shipped hooks behind an experimental setting; check /hooks after installing."})
 	}
 
 	if o.want("opencode") {
@@ -168,8 +169,10 @@ func Plan(o InstallOptions) ([]Planned, error) {
 	return out, nil
 }
 
-// Apply writes planned files, merging into existing JSON settings and keeping a backup.
-func Apply(plans []Planned) ([]string, error) {
+// Apply writes planned files. Settings files shared with the user are merged:
+// only handlers recognised as afr's own are replaced, everything else is kept,
+// and the previous file is backed up. Writes go through a temp file + rename.
+func Apply(plans []Planned, bin string) ([]string, error) {
 	var done []string
 	for _, p := range plans {
 		if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
@@ -178,15 +181,30 @@ func Apply(plans []Planned) ([]string, error) {
 		content := p.Content
 		if p.Merge {
 			if old, err := os.ReadFile(p.Path); err == nil && len(strings.TrimSpace(string(old))) > 0 {
-				merged, err := mergeHooks(old, p.Content)
+				merged, err := mergeHooks(old, p.Content, bin)
 				if err != nil {
 					return done, fmt.Errorf("%s: %w (fix or remove the file, then rerun)", p.Path, err)
 				}
-				_ = os.WriteFile(p.Path+".afr-bak", old, 0o600)
+				if err := os.WriteFile(p.Path+".afr-bak", old, 0o600); err != nil {
+					return done, fmt.Errorf("%s: could not write backup: %w", p.Path, err)
+				}
 				content = merged
+			} else if err != nil && !os.IsNotExist(err) {
+				return done, fmt.Errorf("%s: %w", p.Path, err)
 			}
 		}
-		if err := os.WriteFile(p.Path, content, 0o644); err != nil {
+		if strings.HasSuffix(p.Path, ".json") {
+			var probe any
+			if err := json.Unmarshal(content, &probe); err != nil {
+				return done, fmt.Errorf("%s: generated content is not valid JSON: %w", p.Path, err)
+			}
+		}
+		tmp := p.Path + ".afr-tmp"
+		if err := os.WriteFile(tmp, content, 0o644); err != nil {
+			return done, err
+		}
+		if err := os.Rename(tmp, p.Path); err != nil {
+			os.Remove(tmp)
 			return done, err
 		}
 		done = append(done, p.Path)
@@ -194,14 +212,51 @@ func Apply(plans []Planned) ([]string, error) {
 	return done, nil
 }
 
-// mergeHooks adds our hook entries without touching anything else, and
-// replaces previous afr entries so reinstalling is idempotent.
-func mergeHooks(oldB, addB []byte) ([]byte, error) {
-	var old, add map[string]any
-	if err := json.Unmarshal(oldB, &old); err != nil {
-		return nil, fmt.Errorf("existing file is not plain JSON")
+// ourCommand matches a hook command line that afr's installer generated:
+// an executable named afr / afr.exe (or the configured binary), quoted or
+// not, optionally preceded by PowerShell's call operator, followed by exactly
+// "hook --agent NAME [--event NAME]". A command that merely mentions afr, or
+// runs something else afterwards, does not match and is left alone.
+func ourCommand(cmd, bin string) bool {
+	names := []string{regexp.QuoteMeta("afr"), regexp.QuoteMeta("afr.exe")}
+	if b := filepath.Base(strings.ReplaceAll(bin, `\`, "/")); b != "" && b != "." {
+		names = append(names, regexp.QuoteMeta(b))
 	}
-	_ = json.Unmarshal(addB, &add)
+	name := `(?:` + strings.Join(names, "|") + `)`
+	exe := `(?:"(?:[^"]*[\\/])?` + name + `"|'(?:[^']*[\\/])?` + name + `'|(?:[^"'\s]*[\\/])?` + name + `)`
+	re := regexp.MustCompile(`^\s*(?:&\s*)?` + exe + `\s+hook\s+--agent\s+[a-z][a-z-]*(?:\s+--event\s+[A-Za-z.]+)?\s*$`)
+	return re.MatchString(cmd)
+}
+
+// handlerIsOurs reports whether a single hook handler object was written by afr.
+func handlerIsOurs(h any, bin string) bool {
+	m, ok := h.(map[string]any)
+	if !ok {
+		return false
+	}
+	found := false
+	for _, k := range []string{"command", "bash", "powershell", "commandWindows"} {
+		if c, ok := m[k].(string); ok {
+			if !ourCommand(c, bin) {
+				return false
+			}
+			found = true
+		}
+	}
+	return found
+}
+
+// mergeHooks adds our hook entries without touching anything else. Within a
+// matcher group ({matcher, hooks:[...]}) only afr's own handlers are removed,
+// so a group the user shares with afr keeps the user's handlers.
+func mergeHooks(oldB, addB []byte, bin string) ([]byte, error) {
+	var old, add map[string]any
+	if err := json.Unmarshal(oldB, &old); err != nil || old == nil {
+		return nil, fmt.Errorf("existing file is not a plain JSON object")
+	}
+	if err := json.Unmarshal(addB, &add); err != nil {
+		return nil, err
+	}
 	for k, v := range add {
 		if k != "hooks" {
 			if _, exists := old[k]; !exists {
@@ -209,15 +264,36 @@ func mergeHooks(oldB, addB []byte) ([]byte, error) {
 			}
 			continue
 		}
-		oh, _ := old["hooks"].(map[string]any)
+		oh, isMap := old["hooks"].(map[string]any)
+		if old["hooks"] != nil && !isMap {
+			return nil, fmt.Errorf(`"hooks" is not an object`)
+		}
 		if oh == nil {
 			oh = map[string]any{}
 		}
 		for ev, entries := range v.(map[string]any) {
 			var kept []any
 			for _, e := range asSlice(oh[ev]) {
-				b, _ := json.Marshal(e)
-				if !strings.Contains(string(b), " hook --agent ") {
+				em, _ := e.(map[string]any)
+				if inner, ok := em["hooks"].([]any); ok { // matcher group
+					var keepInner []any
+					for _, h := range inner {
+						if !handlerIsOurs(h, bin) {
+							keepInner = append(keepInner, h)
+						}
+					}
+					if len(keepInner) == 0 {
+						continue
+					}
+					cp := map[string]any{}
+					for kk, vv := range em {
+						cp[kk] = vv
+					}
+					cp["hooks"] = keepInner
+					kept = append(kept, cp)
+					continue
+				}
+				if !handlerIsOurs(e, bin) {
 					kept = append(kept, e)
 				}
 			}
@@ -245,7 +321,11 @@ func Emit(plans []Planned, dir string) ([]string, error) {
 			return out, err
 		}
 		out = append(out, dst)
-		_ = os.WriteFile(dst+".target.txt", []byte(fmt.Sprintf("target: %s\nmerge into existing: %v\n%s\n", p.Path, p.Merge, p.Note)), 0o644)
+		vs := VendorFor(p.Agent)
+		info := fmt.Sprintf("target: %s\nmerge into existing: %v\n%s\n\nvendor support: %s\nchecked against: %s (%s)\n%s\n", p.Path, p.Merge, p.Note, vs.Status, vs.Docs, vs.Checked, vs.Notes)
+		if err := os.WriteFile(dst+".target.txt", []byte(info), 0o644); err != nil {
+			return out, err
+		}
 	}
 	sort.Strings(out)
 	return out, nil
@@ -293,4 +373,37 @@ export const AgentFlightRecorder = async ({ directory }) => {
   };
 };
 `
+}
+
+// VendorSupport records what each integration was checked against. None has
+// been exercised against a real agent by this project's tests: payloads are
+// synthetic. "documented" means the config shape and deny protocol match the
+// vendor's published documentation on the date given.
+type VendorSupport struct {
+	Agent, Status, Docs, Checked, Notes string
+}
+
+var VendorSupportTable = []VendorSupport{
+	{"claude-code", "documented, unverified against a real install", "https://code.claude.com/docs/en/hooks", "2026-10-31",
+		"settings.json hooks; matcher groups; timeout in seconds; PreToolUse deny via hookSpecificOutput.permissionDecision; PostToolUse fires after success, PostToolUseFailure after failure; managed settings support allowManagedHooksOnly."},
+	{"codex", "documented, unverified against a real install", "https://learn.chatgpt.com/docs/hooks (redirect target of developers.openai.com/codex/hooks)", "2026-10-31",
+		"hooks.json; timeout in seconds; PreToolUse deny via hookSpecificOutput.permissionDecision (exit 2 also blocks); non-managed hooks require user trust; managed hooks via requirements.toml."},
+	{"copilot", "experimental", "https://docs.github.com/en/copilot/reference/hooks-reference ; https://code.visualstudio.com/docs/agent-customization/hooks", "2026-10-30",
+		"hook file version 1 with bash/powershell and timeoutSec; deny via permissionDecision. VS Code agent hooks are in preview and their full payload schema was not confirmed; policy.d is documented for Copilot CLI."},
+	{"cursor", "experimental", "https://cursor.com/docs/hooks", "2026-10-30",
+		"hooks.json version 1; exit code 2 denies; permission field. Enterprise file locations not confirmed."},
+	{"gemini-cli", "experimental", "https://geminicli.com/docs/hooks/", "2026-10-31",
+		"settings.json hooks with matcher groups; timeout in milliseconds; exit 2 blocks with stderr as reason. Stdin field names were not listed in the documentation read."},
+	{"opencode", "experimental", "OpenCode plugin documentation and community references", "2026-10-30",
+		"JS plugin; throwing from tool.execute.before blocks the tool. Plugin directory name differs between versions."},
+}
+
+// VendorFor returns the support record for an agent.
+func VendorFor(agent string) VendorSupport {
+	for _, v := range VendorSupportTable {
+		if v.Agent == agent {
+			return v
+		}
+	}
+	return VendorSupport{Agent: agent, Status: "unknown"}
 }

@@ -12,25 +12,32 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// openSnapshot copies a SQLite database together with its -wal/-shm files to a
-// temp directory and opens the copy. The original is never opened, so we don't
-// checkpoint the WAL or change timestamps on the evidence, and we still see
-// writes that only exist in the WAL.
-func openSnapshot(path string) (*sql.DB, func(), error) {
+// openWorkingCopy copies an acquired SQLite snapshot (database plus any -wal
+// and -shm captured with it) to a scratch directory and opens that. Opening a
+// WAL database can checkpoint it, so the acquired snapshot is never opened
+// directly: its bytes stay identical to what was hashed.
+func openWorkingCopy(path string) (*sql.DB, func(), error) {
 	dir, err := os.MkdirTemp("", "afr-db-*")
 	if err != nil {
 		return nil, nil, err
 	}
 	cleanup := func() { os.RemoveAll(dir) }
-	dst := filepath.Join(dir, "snap.db")
+	dst := filepath.Join(dir, "work.db")
 	for _, suf := range []string{"", "-wal", "-shm"} {
-		if err := copyFile(path+suf, dst+suf); err != nil && suf == "" {
-			cleanup()
-			return nil, nil, err
+		if err := copyFile(path+suf, dst+suf); err != nil {
+			if suf == "" || !os.IsNotExist(err) {
+				cleanup()
+				return nil, nil, err
+			}
 		}
 	}
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dst)+"?_pragma=busy_timeout(5000)")
 	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
 		cleanup()
 		return nil, nil, err
 	}
@@ -47,9 +54,16 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// quoteIdent quotes an SQLite identifier taken from an untrusted database.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 func tables(db *sql.DB) map[string]bool {
@@ -68,8 +82,10 @@ func tables(db *sql.DB) map[string]bool {
 	return t
 }
 
+// kvRows reads a key/value table. table and where are fixed strings chosen by
+// the caller, never values taken from the database.
 func kvRows(db *sql.DB, table, where string) ([][2]string, error) {
-	rows, err := db.Query(fmt.Sprintf(`SELECT key, CAST(value AS TEXT) FROM %s WHERE %s ORDER BY rowid`, table, where))
+	rows, err := db.Query(fmt.Sprintf(`SELECT key, CAST(value AS TEXT) FROM %s WHERE %s ORDER BY rowid`, quoteIdent(table), where))
 	if err != nil {
 		return nil, err
 	}
@@ -87,20 +103,19 @@ func kvRows(db *sql.DB, table, where string) ([][2]string, error) {
 
 // ---------------------------------------------------------------- VS Code state.vscdb
 
-func parseVSCodeStateDB(s Source) ([]Event, error) {
-	db, done, err := openSnapshot(s.Path)
+func parseVSCodeStateDB(s Source, c *pctx) error {
+	db, done, err := openWorkingCopy(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer done()
 	if !tables(db)["ItemTable"] {
-		return nil, nil
+		return nil
 	}
 	kvs, err := kvRows(db, "ItemTable", `key LIKE '%interactive%' OR key LIKE '%chat%'`)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	c := newCtx(s.Agent, s.Path)
 	for _, kv := range kvs {
 		v := Decode(kv[1])
 		var walk func(x any)
@@ -123,19 +138,18 @@ func parseVSCodeStateDB(s Source) ([]Event, error) {
 		}
 		walk(v)
 	}
-	return c.events, nil
+	return nil
 }
 
 // ---------------------------------------------------------------- Cursor
 
-func parseCursorDB(s Source) ([]Event, error) {
-	db, done, err := openSnapshot(s.Path)
+func parseCursorDB(s Source, c *pctx) error {
+	db, done, err := openWorkingCopy(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer done()
 	t := tables(db)
-	c := newCtx(s.Agent, s.Path)
 	switch {
 	case t["cursorDiskKV"]:
 		// composer order: composerData:<id>.fullConversationHeadersOnly[].bubbleId
@@ -152,7 +166,7 @@ func parseCursorDB(s Source) ([]Event, error) {
 		}
 		bubbles, err := kvRows(db, "cursorDiskKV", `key LIKE 'bubbleId:%'`)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		type bub struct {
 			comp, id string
@@ -204,33 +218,34 @@ func parseCursorDB(s Source) ([]Event, error) {
 					if rt == "" {
 						rt = JSONString(res)
 					}
-					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(tf, "toolCallId"), Text: rt}, nil, r)
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(tf, "toolCallId"), Text: rt, Status: cursorStatus(tf)}, nil, r)
+				} else if st := cursorStatus(tf); st != "" {
+					c.emit(Event{TS: ts, Kind: KindToolResult, CallID: Str(tf, "toolCallId"), Status: st}, nil, r)
 				}
 			}
 		}
 	default:
-		return genericSQLite(s, db)
+		return genericSQLite(s, c, db)
 	}
-	return c.events, nil
+	return nil
 }
 
 // ---------------------------------------------------------------- OpenCode SQLite
 
-func parseOpenCodeDB(s Source) ([]Event, error) {
-	db, done, err := openSnapshot(s.Path)
+func parseOpenCodeDB(s Source, c *pctx) error {
+	db, done, err := openWorkingCopy(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer done()
 	t := tables(db)
-	c := newCtx(s.Agent, s.Path)
 	switch {
 	case t["part"] && t["message"]: // current TypeScript releases: JSON in data columns
 		rows, err := db.Query(`SELECT p.id, p.session_id, CAST(p.data AS TEXT), CAST(m.data AS TEXT)
 			FROM part p JOIN message m ON m.id = p.message_id
 			ORDER BY p.session_id, m.id, p.id`)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -255,7 +270,7 @@ func parseOpenCodeDB(s Source) ([]Event, error) {
 	case t["messages"]: // original Go implementation: parts JSON array per message
 		rows, err := db.Query(`SELECT id, session_id, role, CAST(parts AS TEXT), created_at FROM messages ORDER BY session_id, created_at, rowid`)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -274,9 +289,9 @@ func parseOpenCodeDB(s Source) ([]Event, error) {
 			}
 		}
 	default:
-		return genericSQLite(s, db)
+		return genericSQLite(s, c, db)
 	}
-	return c.events, nil
+	return nil
 }
 
 func (c *pctx) attachOpenCodeDirs(db *sql.DB) {
@@ -300,12 +315,19 @@ func (c *pctx) attachOpenCodeDirs(db *sql.DB) {
 	}
 }
 
-// genericSQLite dumps every JSON-looking text cell through the generic extractor.
-func genericSQLite(s Source, db *sql.DB) ([]Event, error) {
-	c := newCtx(s.Agent, s.Path)
-	for tbl := range tables(db) {
-		rows, err := db.Query(fmt.Sprintf(`SELECT * FROM "%s" ORDER BY rowid LIMIT 200000`, tbl))
+// genericSQLite dumps every JSON-looking text cell through the generic
+// extractor. Table and column names come from the untrusted database and are
+// quoted; tables that cannot be read are reported, not skipped silently.
+func genericSQLite(s Source, c *pctx, db *sql.DB) error {
+	names := make([]string, 0)
+	for t := range tables(db) {
+		names = append(names, t)
+	}
+	sort.Strings(names)
+	for _, tbl := range names {
+		rows, err := db.Query(fmt.Sprintf(`SELECT * FROM %s LIMIT 200000`, quoteIdent(tbl)))
 		if err != nil {
+			c.diag("table %q not readable: %v", tbl, err)
 			continue
 		}
 		cols, _ := rows.Columns()
@@ -315,7 +337,9 @@ func genericSQLite(s Source, db *sql.DB) ([]Event, error) {
 			for i := range vals {
 				ptrs[i] = &vals[i]
 			}
-			if rows.Scan(ptrs...) != nil {
+			if err := rows.Scan(ptrs...); err != nil {
+				c.malformed++
+				c.diag("table %q: row not readable: %v", tbl, err)
 				continue
 			}
 			for i, v := range vals {
@@ -335,7 +359,17 @@ func genericSQLite(s Source, db *sql.DB) ([]Event, error) {
 				}
 			}
 		}
+		if err := rows.Err(); err != nil {
+			c.diag("table %q: read stopped: %v", tbl, err)
+		}
 		rows.Close()
 	}
-	return c.events, nil
+	return nil
+}
+
+func cursorStatus(tf map[string]any) string {
+	if d := strings.ToLower(Str(tf, "userDecision")); d == "rejected" || d == "denied" {
+		return StatusRejected
+	}
+	return NormStatus(tf["status"])
 }

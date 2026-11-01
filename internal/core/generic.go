@@ -11,18 +11,17 @@ import (
 // without notice, and new agents appear faster than adapters get written.
 // Output from here is marked so the analyst knows it's best-effort.
 
-func parseGeneric(s Source) ([]Event, error) {
-	c := newCtx(s.Agent, s.Path)
+func parseGeneric(s Source, c *pctx) error {
 	if strings.HasSuffix(s.Path, ".jsonl") {
-		err := readJSONL(s.Path, func(n int, m map[string]any) { c.genericWalk(m, ref(s.Path, n)) })
-		return c.events, err
+		err := readJSONL(s.rp(), c, func(n int, m map[string]any) { c.genericWalk(m, ref(s.Path, n)) })
+		return err
 	}
-	v, err := readJSON(s.Path)
+	v, err := readJSON(s.rp())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	c.genericWalk(v, filepath.Base(s.Path))
-	return c.events, nil
+	return nil
 }
 
 var (
@@ -33,11 +32,17 @@ var (
 	tsKeys       = []string{"timestamp", "ts", "time", "createdAt", "created_at", "created", "date", "startTime"}
 )
 
-func (c *pctx) genericWalk(v any, r string) {
+func (c *pctx) genericWalk(v any, r string) { c.genericWalkDepth(v, r, 0) }
+
+func (c *pctx) genericWalkDepth(v any, r string, depth int) {
+	if depth > maxWalkDepth {
+		c.diag("%s: JSON nested deeper than %d levels, deeper content not examined", r, maxWalkDepth)
+		return
+	}
 	switch t := v.(type) {
 	case []any:
 		for _, x := range t {
-			c.genericWalk(x, r)
+			c.genericWalkDepth(x, r, depth+1)
 		}
 	case map[string]any:
 		for _, k := range tsKeys {
@@ -57,10 +62,10 @@ func (c *pctx) genericWalk(v any, r string) {
 		for _, k := range keys {
 			switch t[k].(type) {
 			case map[string]any, []any:
-				c.genericWalk(t[k], r)
+				c.genericWalkDepth(t[k], r, depth+1)
 			case string:
 				if d := Decode(t[k]); d != t[k] {
-					c.genericWalk(d, r)
+					c.genericWalkDepth(d, r, depth+1)
 				}
 			}
 		}
@@ -92,13 +97,13 @@ func (c *pctx) genericClassify(m map[string]any, r string) bool {
 
 	if isResultType {
 		_, res := firstKey(m, append(toolResKeys, "content", "text"))
-		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: callID, Text: textOf(Decode(res))}, nil, r)
+		c.emit(Event{TS: ts, Kind: KindToolResult, CallID: callID, Text: textOf(Decode(res)), Status: genericStatus(m)}, nil, r)
 		return true
 	}
 	if ns, ok := name.(string); ok && (isToolType || (args != nil && nameKey != "name") || (args != nil && nameKey == "name" && typ != "")) {
 		c.emit(Event{TS: ts, Kind: KindToolCall, Tool: ns, CallID: callID, Input: JSONString(args)}, Decode(args), r)
 		if _, res := firstKey(m, toolResKeys); res != nil {
-			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: callID, Text: textOf(Decode(res))}, nil, r)
+			c.emit(Event{TS: ts, Kind: KindToolResult, CallID: callID, Text: textOf(Decode(res)), Status: genericStatus(m)}, nil, r)
 		}
 		return true
 	}
@@ -156,4 +161,16 @@ func roleKind(role, typ, txt string) Kind {
 		return KindPrompt
 	}
 	return KindResponse
+}
+
+func genericStatus(m map[string]any) string {
+	if v, ok := m["is_error"].(bool); ok {
+		return NormStatus(!v)
+	}
+	for _, k := range []string{"status", "success", "resultType", "state"} {
+		if st := NormStatus(m[k]); st != "" {
+			return st
+		}
+	}
+	return ""
 }

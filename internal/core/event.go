@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Version is stamped into every manifest and live event.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Kind is the normalised type of a step in an agent session.
 type Kind string
@@ -32,14 +33,37 @@ const (
 	KindOther        Kind = "other"
 )
 
+// Vendor-reported status of a tool result, normalised.
+const (
+	StatusSuccess   = "success"
+	StatusError     = "error"
+	StatusCancelled = "cancelled"
+	StatusRejected  = "rejected" // the user (not policy) declined the call
+	StatusRunning   = "running"
+)
+
+// Outcome of a tool call as established by the captured record. Derived at
+// report time from the call, any policy decision and any correlated result.
+const (
+	OutcomeRequested = "requested" // call recorded, no result recorded
+	OutcomeBlocked   = "blocked"   // denied by policy or rejected by the user
+	OutcomeFailed    = "failed"    // a correlated result reports an error
+	OutcomeCompleted = "completed" // a correlated result reports success
+	OutcomeUnknown   = "unknown"   // a result exists but its status is not recorded, or it cannot be correlated
+)
+
 // Event is one step on the reconstructed timeline. Offline adapters and the
 // live hook recorder both emit this shape, so the report works on either.
+//
+// Fields marked "not hashed" are provenance or derived data. They are cleared
+// before computing the live-log chain hash, so they can be filled in later
+// without invalidating a record.
 type Event struct {
 	TS        time.Time `json:"ts"`
 	Agent     string    `json:"agent"`  // copilot-vscode, claude-code, codex, opencode...
 	Origin    string    `json:"origin"` // offline | live
 	SessionID string    `json:"session_id,omitempty"`
-	Seq       int       `json:"seq"` // order inside the session as found in the source
+	Seq       int       `json:"seq"` // source-local sequence as emitted by the parser (0 for live records)
 	Kind      Kind      `json:"kind"`
 	Tool      string    `json:"tool,omitempty"`
 	CallID    string    `json:"call_id,omitempty"`
@@ -49,39 +73,67 @@ type Event struct {
 	Paths     []string  `json:"paths,omitempty"` // file paths referenced by input or output
 	Cwd       string    `json:"cwd,omitempty"`
 	Model     string    `json:"model,omitempty"`
-	Decision  string    `json:"decision,omitempty"` // allow | deny | alert (live)
+	Decision  string    `json:"decision,omitempty"` // deny | alert (live policy)
 	Reason    string    `json:"reason,omitempty"`
 	Source    string    `json:"source,omitempty"` // source file (offline) or hook event name (live)
 	SourceRef string    `json:"source_ref,omitempty"`
 	Host      string    `json:"host,omitempty"`
 	User      string    `json:"user,omitempty"`
 	TSInexact bool      `json:"ts_inexact,omitempty"` // timestamp inherited, not native to the step
+	Status    string    `json:"status,omitempty"`     // vendor-reported result status (tool_result)
+	Error     string    `json:"error,omitempty"`      // vendor-reported error text, if separate
 
-	// Live-only tamper evidence: hash of previous record + this record.
+	// Live-only chain: hash of previous record + this record.
 	PrevHash string `json:"prev_hash,omitempty"`
 	Hash     string `json:"hash,omitempty"`
+
+	Pos         int    `json:"pos,omitempty"`          // not hashed: position within its input (line or emission order)
+	Prov        string `json:"prov,omitempty"`         // not hashed: input the event was read from (bundle entry, log path)
+	Outcome     string `json:"outcome,omitempty"`      // not hashed: derived at report time
+	OutcomeNote string `json:"outcome_note,omitempty"` // not hashed: why the outcome is what it is
 }
 
-// ComputeHash returns the chain hash for a live event (Hash field excluded).
+// ComputeHash returns the chain hash for a live event. Provenance and derived
+// fields are excluded so that display metadata never changes signed content.
 func (e Event) ComputeHash() string {
 	c := e
-	c.Hash = ""
+	c.Hash, c.Pos, c.Prov, c.Outcome, c.OutcomeNote = "", 0, "", "", ""
 	b, _ := json.Marshal(c)
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
 }
 
-// SortEvents orders events by session then sequence, falling back to time.
+// ScopeKey identifies the record stream an event belongs to. Sessions are
+// never merged across hosts, users, origins, agents or input sources, and
+// events without a session ID are kept apart from every named session.
+func (e Event) ScopeKey() string {
+	sid := e.SessionID
+	if sid == "" {
+		sid = "\x00unscoped"
+	}
+	return strings.Join([]string{e.Prov, e.Origin, e.Host, e.User, e.Agent, e.Source0(), sid}, "\x1f")
+}
+
+// Source0 is the source used for scoping: the artifact path for offline
+// events. Live events share one log, so their hook event name is not used.
+func (e Event) Source0() string {
+	if e.Origin == "live" {
+		return ""
+	}
+	return e.Source
+}
+
+// SortEvents applies a deterministic order: grouped by scope, then by the
+// position each event had in its own input. It does not interleave different
+// sources by timestamp, because timestamps across sources do not establish a
+// causal order.
 func SortEvents(evs []Event) {
 	sort.SliceStable(evs, func(i, j int) bool {
-		a, b := evs[i], evs[j]
-		if !a.TS.Equal(b.TS) && !(a.SessionID == b.SessionID && a.Agent == b.Agent) {
-			return a.TS.Before(b.TS)
+		ki, kj := evs[i].ScopeKey(), evs[j].ScopeKey()
+		if ki != kj {
+			return ki < kj
 		}
-		if a.SessionID == b.SessionID && a.Agent == b.Agent && a.Seq != b.Seq {
-			return a.Seq < b.Seq
-		}
-		return a.TS.Before(b.TS)
+		return evs[i].Pos < evs[j].Pos
 	})
 }
 
@@ -92,38 +144,83 @@ var pathRe = regexp.MustCompile(`(?:[A-Za-z]:\\|\\\\|/|~[/\\]|\.{1,2}[/\\])[^\s"
 // pathKeys are argument names agents use for file locations.
 var pathKeys = map[string]bool{
 	"path": true, "file_path": true, "filepath": true, "filePath": true, "file": true,
-	"filename": true, "target_file": true, "absolute_path": true, "uri": true,
-	"directory": true, "dir": true, "dirPath": true, "dir_path": true, "cwd": true,
-	"notebook_path": true, "paths": true, "files": true, "includePattern": true,
+	"filename": true, "target_file": true, "absolute_path": true, "uri": true, "fsPath": true,
+	"directory": true, "dir": true, "dirPath": true, "dir_path": true,
+	"notebook_path": true, "paths": true, "files": true,
 	"relative_workspace_path": true, "target_directory": true, "source": true, "destination": true,
+}
+
+// searchKeys hold search terms or patterns, not locations that were accessed.
+var searchKeys = map[string]bool{
+	"query": true, "pattern": true, "includePattern": true, "glob": true, "regex": true, "search": true,
+}
+
+// maxWalkDepth bounds recursion over untrusted JSON.
+const maxWalkDepth = 64
+
+// PathArgs returns string values held under path-like argument keys only,
+// i.e. locations the tool was asked to operate on, as opposed to search
+// patterns, commands or free text.
+func PathArgs(v any) []string {
+	set := map[string]bool{}
+	var walk func(key string, x any, depth int)
+	walk = func(key string, x any, depth int) {
+		if depth > maxWalkDepth {
+			return
+		}
+		switch t := x.(type) {
+		case map[string]any:
+			for k, vv := range t {
+				walk(k, vv, depth+1)
+			}
+		case []any:
+			for _, vv := range t {
+				walk(key, vv, depth+1)
+			}
+		case string:
+			if pathKeys[key] && t != "" && len(t) < 4096 {
+				set[cleanPath(t)] = true
+			}
+		}
+	}
+	walk("", v, 0)
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ExtractPaths finds file paths in a decoded JSON value (by key) and in free text.
 func ExtractPaths(v any, text string) []string {
 	set := map[string]bool{}
-	var walk func(key string, x any)
-	walk = func(key string, x any) {
+	var walk func(key string, x any, depth int)
+	walk = func(key string, x any, depth int) {
+		if depth > maxWalkDepth {
+			return
+		}
 		switch t := x.(type) {
 		case map[string]any:
 			for k, vv := range t {
-				walk(k, vv)
+				walk(k, vv, depth+1)
 			}
 		case []any:
 			for _, vv := range t {
-				walk(key, vv)
+				walk(key, vv, depth+1)
 			}
 		case string:
 			if pathKeys[key] && t != "" && len(t) < 1024 {
 				set[cleanPath(t)] = true
 			}
-			if key == "command" || key == "cmd" || key == "script" || key == "query" || key == "pattern" {
+			if key == "command" || key == "cmd" || key == "script" || searchKeys[key] {
 				for _, m := range pathRe.FindAllString(t, 20) {
 					set[cleanPath(m)] = true
 				}
 			}
 		}
 	}
-	walk("", v)
+	walk("", v, 0)
 	if text != "" {
 		t := text
 		if len(t) > 200000 {
@@ -269,10 +366,42 @@ func Get(m map[string]any, path string) any {
 	return cur
 }
 
-// Truncate caps long strings so reports and logs stay readable.
+// Truncate caps long strings so reports and logs stay readable. It cuts on a
+// UTF-8 boundary. Callers must redact before truncating: a cut can split a
+// secret so that redaction patterns no longer match.
 func Truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 || len(s) <= n {
 		return s
 	}
-	return s[:n] + "\n...[truncated " + strconv.Itoa(len(s)-n) + " bytes]"
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n...[truncated " + strconv.Itoa(len(s)-cut) + " bytes]"
+}
+
+// NormStatus maps the many ways vendors report a tool result into one of the
+// Status constants, or "" when nothing conclusive is recorded.
+func NormStatus(v any) string {
+	switch t := v.(type) {
+	case bool:
+		if t {
+			return StatusSuccess
+		}
+		return StatusError
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "success", "succeeded", "completed", "complete", "ok", "done":
+			return StatusSuccess
+		case "error", "failed", "failure", "errored":
+			return StatusError
+		case "cancelled", "canceled", "aborted", "interrupted":
+			return StatusCancelled
+		case "rejected", "denied", "declined":
+			return StatusRejected
+		case "running", "pending", "in_progress":
+			return StatusRunning
+		}
+	}
+	return ""
 }

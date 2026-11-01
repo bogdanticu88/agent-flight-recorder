@@ -37,11 +37,11 @@ func TestNormaliseAndChain(t *testing.T) {
 		if e.Kind != KindToolCall || e.SessionID == "" || len(e.Paths) == 0 {
 			t.Errorf("%s: bad normalisation %+v", p.agent, e)
 		}
-		if err := AppendLive(log, &e); err != nil {
+		if err := AppendLive(log, &e, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, rep := ReadLiveLog(log); rep.Status != "intact" || rep.Records != 4 {
+	if _, rep := ReadLiveLog(log); rep.Status != ChainConsistent || rep.Records != 4 {
 		t.Fatalf("chain: %+v", rep)
 	}
 	b, _ := os.ReadFile(log)
@@ -67,4 +67,16 @@ func TestDenyOnlyOnPreEvents(t *testing.T) {
 	if post.ExitCode != 0 || strings.Contains(post.Stdout, "deny") {
 		t.Errorf("post event must not deny: %+v", post)
 	}
+}
+
+// TestMain keeps every test away from the real machine policy location.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "afr-machine-*")
+	if err != nil {
+		panic(err)
+	}
+	machineDirOverride = dir
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }

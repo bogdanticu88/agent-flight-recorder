@@ -46,15 +46,39 @@ func mustHome() string { h, _ := os.UserHomeDir(); return h }
 
 // Source is one artifact on disk that an adapter knows how to read.
 type Source struct {
-	Agent   string `json:"agent"`
-	Parser  string `json:"parser"`
+	Agent     string         `json:"agent"`
+	Parser    string         `json:"parser"`
+	Path      string         `json:"path"`
+	Size      int64          `json:"size"`
+	ModTime   string         `json:"mtime"`
+	SHA256    string         `json:"sha256,omitempty"` // of the acquired bytes (single file)
+	Files     []FileEvidence `json:"files,omitempty"`  // per-file evidence (directories, SQLite sidecars)
+	Snapshot  string         `json:"snapshot,omitempty"`
+	Events    int            `json:"events"`
+	Malformed int            `json:"malformed,omitempty"`
+	Diags     []string       `json:"diagnostics,omitempty"`
+	Error     string         `json:"error,omitempty"`
+	Note      string         `json:"note,omitempty"`
+
+	snapshot string // local path of the acquired copy that parsers read
+}
+
+// FileEvidence records one acquired file.
+type FileEvidence struct {
 	Path    string `json:"path"`
+	Role    string `json:"role,omitempty"` // main | wal | shm | child
 	Size    int64  `json:"size"`
 	ModTime string `json:"mtime"`
-	SHA256  string `json:"sha256,omitempty"`
-	Events  int    `json:"events"`
-	Error   string `json:"error,omitempty"`
-	Note    string `json:"note,omitempty"`
+	SHA256  string `json:"sha256"`
+	Changed bool   `json:"changed_during_acquisition,omitempty"`
+}
+
+// rp is the path parsers read: the acquired snapshot when there is one.
+func (s Source) rp() string {
+	if s.snapshot != "" {
+		return s.snapshot
+	}
+	return s.Path
 }
 
 type sourceSpec struct {
@@ -182,6 +206,9 @@ func Discover(r Roots, agents map[string]bool) []Source {
 				if err != nil || st.IsDir() != sp.isDir {
 					continue
 				}
+				if lst, err := os.Lstat(p); err == nil && lst.Mode()&os.ModeSymlink != 0 {
+					st = lst // acquisition decides whether the link may be followed
+				}
 				key := sp.parser + "|" + p
 				if seen[key] {
 					continue
@@ -249,29 +276,4 @@ var instructionFiles = []string{
 	filepath.Join(".cursor", "rules"), filepath.Join(".cursor", "hooks.json"), filepath.Join(".cursor", "mcp.json"),
 	filepath.Join(".vscode", "mcp.json"), filepath.Join(".vscode", "settings.json"),
 	filepath.Join(".gemini", "settings.json"), "opencode.json", filepath.Join(".opencode", "plugin"),
-}
-
-// WorkspaceArtifacts returns instruction/config files under a workspace folder.
-func WorkspaceArtifacts(ws string) []string {
-	var out []string
-	for _, rel := range instructionFiles {
-		p := filepath.Join(ws, rel)
-		st, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		if !st.IsDir() {
-			out = append(out, p)
-			continue
-		}
-		_ = filepath.WalkDir(p, func(q string, d fs.DirEntry, err error) error {
-			if err == nil && !d.IsDir() {
-				if info, e := d.Info(); e == nil && info.Size() < 2<<20 {
-					out = append(out, q)
-				}
-			}
-			return nil
-		})
-	}
-	return out
 }
