@@ -1,10 +1,12 @@
 package core
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestRedact(t *testing.T) {
@@ -48,6 +50,32 @@ func TestNormaliseAndChain(t *testing.T) {
 	os.WriteFile(log, []byte(strings.Replace(string(b), "secret.txt", "public.txt", 1)), 0o600)
 	if _, rep := ReadLiveLog(log); rep.Status != "broken" {
 		t.Fatalf("tampering not detected: %+v", rep)
+	}
+}
+
+func TestLiveChainWithTruncatedUnicode(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"hook_event_name": "PostToolUse",
+		"tool_output":     strings.Repeat("a", 7999) + "漢字 output",
+		"tool_input":      strings.Repeat("b", 7999) + "🙂 input",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NormaliseHook("claude-code", "", raw, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(e.Text) || !utf8.ValidString(e.Input) {
+		t.Fatal("truncated text and input must remain valid UTF-8")
+	}
+
+	log := filepath.Join(t.TempDir(), "events.jsonl")
+	if err := AppendLive(log, &e); err != nil {
+		t.Fatal(err)
+	}
+	if _, rep := ReadLiveLog(log); rep.Status != "intact" {
+		t.Fatalf("chain with truncated Unicode: %+v", rep)
 	}
 }
 
