@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Version is stamped into every manifest and live event.
@@ -271,8 +272,13 @@ func Get(m map[string]any, path string) any {
 
 // Truncate caps long strings so reports and logs stay readable.
 func Truncate(s string, n int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "\n...[truncated " + strconv.Itoa(len(s)-n) + " bytes]"
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n...[truncated " + strconv.Itoa(len(s)-cut) + " bytes]"
 }
